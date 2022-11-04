@@ -59,7 +59,7 @@
                "[[:space:]]*;+[[:space:]]*Package-Requires:[[:space:]]*" nil t)
               (read (current-buffer))))))))
 
-(defconst ekipage-default-files
+(defconst ekipage--default-files
   '("*.el" "lisp/*.el"
     "dir" "*.info" "*.texi" "*.texinfo"
     "doc/dir" "doc/*.info" "doc/*.texi" "doc/*.texinfo"
@@ -76,9 +76,9 @@ Returns a list of (SRCPATH . DST-SUBDIR) pairs where SRCPATH is a file
 relative to SRC-DIR that should be copied the DST-SUBDIR subdirectory
 of the destination build directory."
   (cond
-   ((null files) (setq files ekipage-default-files))
+   ((null files) (setq files ekipage--default-files))
    ((eq (car files) :defaults)
-    (setq files (append ekipage-default-files (cdr files)))))
+    (setq files (append ekipage--default-files (cdr files)))))
   (let ((default-directory src-dir)
         (stack (list (cons "" files)))
         exclude result)
@@ -117,23 +117,26 @@ of the destination build directory."
 (defun ekipage--clone-package (_recipe)
   (error "TODO"))
 
+(defcustom ekipage-byte-compilation-buffer "*ekipage-byte-compilation*"
+  "Name of the byte-compilation log buffer, or nil to discard output."
+  :type '(choice (string :tag "Buffer name")
+                 (const :tag "Discard output" nil)))
+
 (defun ekipage--build-package (package build-dir)
-  "Byte-compiles PACKAGE located in BUILD-DIR.
-Returns the generated autoloads such that they can be loaded with `eval'."
-  (let* ((default-directory build-dir) ;; TODO Remove?
+  "Byte-compile PACKAGE inside of BUILD-DIR.
+Returns the generated autoloads loadable via `eval'."
+  (let* ((default-directory build-dir)
          (emacs (concat invocation-directory invocation-name))
          (program (format "(let ((default-directory %S))
   (normal-top-level-add-subdirs-to-load-path)
   (byte-recompile-directory %S 0 'force))"
                           (concat build-dir "/..") build-dir))
          (args (list "-Q" "--batch" "--eval" program))
-
          (autoloads-file (concat package "-autoloads.el")))
-    ;; TODO Capture output
-    (apply #'call-process emacs nil nil nil args)
+    ;; Byte-compile in subprocess to have a clean environment
+    (apply #'call-process emacs nil ekipage-byte-compilation-buffer nil args)
     ;; Generate autoloads
     (make-directory-autoloads build-dir autoloads-file)
-
     ;; Read generated autoloads
     ;; TODO Find output files overriden with generated-autoload-file
     (with-temp-buffer
@@ -173,9 +176,10 @@ Returns the generated autoloads such that they can be loaded with `eval'."
           )
       (malformed (delete-file cache-file) (make-hash-table))
       (file-missing (make-hash-table)))) ; Proceed with default value
-  "Map of symbols of up-to-date packages to (RECIPE DEPENDENCIES . AUTOLOADS) tuples.")
+  "Map of up-to-date packages to (RECIPE DEPENDENCIES . AUTOLOADS) tuples.")
 
 (defun ekipage--write-cache ()
+  ;; TODO Remove "modified" packages directory afterward
   (with-temp-file (expand-file-name "cache" ekipage-base-dir)
     (let (print-length print-level)
       (print ekipage--package-cache (current-buffer)))))
@@ -190,48 +194,46 @@ Returns the generated autoloads such that they can be loaded with `eval'."
     (melpa-style-recipe
      &aux (name (if (listp melpa-style-recipe) (car melpa-style-recipe) melpa-style-recipe)))
   "Do thing.
-RECIPE is a MELPA style recipe"
-  (cond
-   ((and (symbolp melpa-style-recipe) (memq name ekipage--ignored-dependencies))
-    nil)
-   ;; If in cache and not modified: Just activate
-   ((pcase (gethash name ekipage--package-cache)
-      ;; TODO Check that recipe is the same
-      (`(,recipe ,deps . ,autoloads)
-       (dolist (dep deps) (ekipage-use-package (if (consp dep) (car dep) dep)))
-       (ekipage--activate-package recipe autoloads)
-       t)))
-   (t (let* ((recipe (ekipage--normalize-recipe melpa-style-recipe))
-             (package (plist-get recipe :package))
-             (repo-dir (ekipage--repo-dir recipe))
-             (build-dir (expand-file-name
-                         package (expand-file-name "build2" ekipage-base-dir)))
-             deps autoloads)
-        (unless (file-exists-p repo-dir) (ekipage--clone-package recipe))
+RECIPE is a MELPA style recipe."
+  (and (symbolp melpa-style-recipe) (memq name ekipage--ignored-dependencies)
+       (cl-return-from 'ekipage-use-package))
+  ;; If already built: Just activate
+  (pcase (gethash name ekipage--package-cache)
+    ;; TODO Check that recipe is the same
+    (`(,recipe ,deps . ,autoloads)
+     (dolist (dep deps) (ekipage-use-package (if (consp dep) (car dep) dep)))
+     (ekipage--activate-package recipe autoloads)
+     (cl-return-from 'ekipage-use-package)))
 
-        (delete-directory build-dir t)
-        (make-directory build-dir t)
-        (cl-loop with default-directory = build-dir
-                 for (srcfile . dst-dir)
-                 in (ekipage--calc-symlinks (plist-get recipe :files) repo-dir) do
-                 (make-symbolic-link
-                  (expand-file-name srcfile repo-dir)
-                  (if (string= dst-dir "") "./" (make-directory dst-dir t) dst-dir) t))
+  (let* ((recipe (ekipage--normalize-recipe melpa-style-recipe))
+         (package (plist-get recipe :package))
+         (repo-dir (ekipage--repo-dir recipe))
+         (build-dir (expand-file-name
+                     package (expand-file-name "build2" ekipage-base-dir)))
+         deps autoloads)
+    (unless (file-exists-p repo-dir) (ekipage--clone-package recipe))
 
-        ;; TODO Have to recurse into deps after files copied to build directory and before actually building
-        (setq deps (ekipage--dependencies package build-dir))
-        (dolist (dep deps)
-          (message "Using dependency: %S" dep)
-          (ekipage-use-package (if (consp dep) (car dep) dep)))
+    (delete-directory build-dir t)
+    (make-directory build-dir t)
+    (cl-loop with default-directory = build-dir
+             for (srcfile . dst-dir)
+             in (ekipage--calc-symlinks (plist-get recipe :files) repo-dir) do
+             (make-symbolic-link
+              (expand-file-name srcfile repo-dir)
+              (if (string= dst-dir "") "./" (make-directory dst-dir t) dst-dir) t))
 
-        ;; Build package
-        (message "Compiling %s..." package)
-        (setq autoloads (ekipage--build-package package build-dir))
+    ;; TODO Have to recurse into deps after files copied to build directory and before actually building
+    (setq deps (ekipage--dependencies package build-dir))
+    (dolist (dep deps) (ekipage-use-package (if (consp dep) (car dep) dep)))
 
-        (ekipage--activate-package recipe autoloads)
+    ;; Build package
+    (message "Compiling %s..." package)
+    (setq autoloads (ekipage--build-package package build-dir))
 
-        (puthash name `(,recipe ,deps . ,autoloads) ekipage--package-cache)
-        (when after-init-time (ekipage--write-cache))))))
+    (ekipage--activate-package recipe autoloads)
+
+    (puthash name `(,recipe ,deps . ,autoloads) ekipage--package-cache)
+    (when after-init-time (ekipage--write-cache))))
 
 (let* ((recipe (ekipage--normalize-recipe (ekipage-melpa-retrieve 'magit)))
        (package (plist-get recipe :package))
@@ -245,3 +247,5 @@ RECIPE is a MELPA style recipe"
   (message "dependencies: %s" deps)
   (message "repo: %s" (ekipage--repo-dir recipe))
   cps)
+
+;;; ekipage.el ends here
