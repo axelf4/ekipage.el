@@ -127,18 +127,18 @@ of the destination build directory."
 Returns the generated autoloads loadable via `eval'."
   (let* ((default-directory build-dir)
          (emacs (concat invocation-directory invocation-name))
-         (program (format "(let ((default-directory %S))
+         (expr (format "(let ((default-directory %S))
   (normal-top-level-add-subdirs-to-load-path)
-  (byte-recompile-directory %S 0 'force))"
+  (byte-recompile-directory %S 0 t t))"
                           (concat build-dir "/..") build-dir))
-         (args (list "-Q" "--batch" "--eval" program))
          (autoloads-file (concat package "-autoloads.el")))
     ;; Byte-compile in subprocess to have a clean environment
-    (apply #'call-process emacs nil ekipage-byte-compilation-buffer nil args)
+    (call-process emacs nil ekipage-byte-compilation-buffer nil
+                  "-Q" "--batch" "--eval" expr)
     ;; Generate autoloads
     (make-directory-autoloads build-dir autoloads-file)
     ;; Read generated autoloads
-    ;; TODO Find output files overriden with generated-autoload-file
+    ;; TODO Find output files overridden with generated-autoload-file
     (with-temp-buffer
       (insert-file-contents-literally autoloads-file)
       ;; Normalize the $# reader macro
@@ -150,19 +150,15 @@ Returns the generated autoloads loadable via `eval'."
            ,@(nreverse result))))))
 
 ;; TODO Inline?
-(defun ekipage--activate-package (recipe &optional autoloads)
+(defun ekipage--activate-package (recipe autoloads)
   "Activate the package built by RECIPE."
   (let* ((package (plist-get recipe :package))
          (build-dir (expand-file-name package
-                                      (expand-file-name "build2" ekipage-base-dir)))
-         (autoloads-file (expand-file-name (concat package "-autoloads.el") build-dir)))
-    (message "Activating: %S" recipe)
+                                      (expand-file-name "build2" ekipage-base-dir))))
     (cl-pushnew build-dir load-path)
-    (if autoloads
-        (eval autoloads) ;; Cache autoloads to avoid loading file
-      (load autoloads-file nil t))))
+    (eval autoloads))) ;; Cache autoloads to avoid loading file
 
-(defvar ekipage--package-cache
+(defvar ekipage--cache
   ;; TODO Allow checking if modified using find(1)
   (let ((cache-file (expand-file-name "cache" ekipage-base-dir)))
     (condition-case nil
@@ -172,7 +168,7 @@ Returns the generated autoloads loadable via `eval'."
           (let ((cache (read (current-buffer))))
             (unless (hash-table-p cache) (signal 'malformed cache))
             cache)
-          ;; TODO Remove any packages found in modified directory
+          ;; TODO Remove any packages found in "modified" directory
           )
       (malformed (delete-file cache-file) (make-hash-table))
       (file-missing (make-hash-table)))) ; Proceed with default value
@@ -182,9 +178,7 @@ Returns the generated autoloads loadable via `eval'."
   ;; TODO Remove "modified" packages directory afterward
   (with-temp-file (expand-file-name "cache" ekipage-base-dir)
     (let (print-length print-level)
-      (print ekipage--package-cache (current-buffer)))))
-
-(add-hook 'after-init-hook #'ekipage--write-cache)
+      (print ekipage--cache (current-buffer)))))
 
 (defconst ekipage--ignored-dependencies '(emacs cl-lib cl-generic nadvice seq)
   "Packages to ignore.")
@@ -196,14 +190,14 @@ Returns the generated autoloads loadable via `eval'."
   "Do thing.
 RECIPE is a MELPA style recipe."
   (and (symbolp melpa-style-recipe) (memq name ekipage--ignored-dependencies)
-       (cl-return-from 'ekipage-use-package))
+       (cl-return-from ekipage-use-package))
   ;; If already built: Just activate
-  (pcase (gethash name ekipage--package-cache)
+  (pcase (gethash name ekipage--cache)
     ;; TODO Check that recipe is the same
     (`(,recipe ,deps . ,autoloads)
      (dolist (dep deps) (ekipage-use-package (if (consp dep) (car dep) dep)))
      (ekipage--activate-package recipe autoloads)
-     (cl-return-from 'ekipage-use-package)))
+     (cl-return-from ekipage-use-package)))
 
   (let* ((recipe (ekipage--normalize-recipe melpa-style-recipe))
          (package (plist-get recipe :package))
@@ -215,37 +209,25 @@ RECIPE is a MELPA style recipe."
 
     (delete-directory build-dir t)
     (make-directory build-dir t)
+    ;; Symlink files used to build the package
     (cl-loop with default-directory = build-dir
              for (srcfile . dst-dir)
              in (ekipage--calc-symlinks (plist-get recipe :files) repo-dir) do
              (make-symbolic-link
               (expand-file-name srcfile repo-dir)
               (if (string= dst-dir "") "./" (make-directory dst-dir t) dst-dir) t))
-
-    ;; TODO Have to recurse into deps after files copied to build directory and before actually building
+    ;; Ensure dependencies are built
     (setq deps (ekipage--dependencies package build-dir))
     (dolist (dep deps) (ekipage-use-package (if (consp dep) (car dep) dep)))
-
-    ;; Build package
+    ;; Build the package
     (message "Compiling %s..." package)
     (setq autoloads (ekipage--build-package package build-dir))
 
     (ekipage--activate-package recipe autoloads)
 
-    (puthash name `(,recipe ,deps . ,autoloads) ekipage--package-cache)
-    (when after-init-time (ekipage--write-cache))))
+    (puthash name `(,recipe ,deps . ,autoloads) ekipage--cache)
+    (if after-init-time (ekipage--write-cache)
+      (add-hook 'after-init-hook #'ekipage--write-cache))))
 
-(let* ((recipe (ekipage--normalize-recipe (ekipage-melpa-retrieve 'magit)))
-       (package (plist-get recipe :package))
-       (cps (ekipage--calc-symlinks
-             ;; (append '(:defaults ("hej" "test/*.el")))
-             (plist-get recipe :files)
-             (expand-file-name "repos/magit" ekipage-base-dir)))
-       (build-dir (expand-file-name
-                   package (expand-file-name "build" ekipage-base-dir)))
-       (deps (ekipage--dependencies package build-dir)))
-  (message "dependencies: %s" deps)
-  (message "repo: %s" (ekipage--repo-dir recipe))
-  cps)
-
+(provide 'ekipage)
 ;;; ekipage.el ends here
