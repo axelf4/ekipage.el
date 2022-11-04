@@ -104,7 +104,7 @@ of the destination build directory."
         result))
 
 ;; TODO Use repos var to unify mono-repo repository in use
-(let ((repos (make-hash-table)))
+(let ((_repos (make-hash-table :test #'equal)))
   (cl-defun ekipage--repo-dir ((&key fetcher repo url &allow-other-keys))
     "Return the repository directory for the package built by RECIPE."
     (expand-file-name
@@ -158,8 +158,28 @@ Returns the generated autoloads loadable via `eval'."
     (cl-pushnew build-dir load-path)
     (eval autoloads))) ;; Cache autoloads to avoid loading file
 
+(defun ekipage--modified-packages (pkg-cache)
+  "Find packages in PKG-CACHE with modified repositories using find(1)."
+  (let* ((repos (make-hash-table :test #'equal))
+         (tests
+          (cl-loop
+           for k being the hash-keys of pkg-cache using (hash-values v) nconc
+           (cl-destructuring-bind (recipe timestamp _deps . autoloads) v
+             (let ((repo (ekipage--repo-dir recipe)))
+               (puthash repo k repos)
+               (list "-o" "-path" (concat repo "/*") "-newermt" timestamp
+                     "-printf" "%H\n" "-prune")))))
+         (args (nconc (cl-loop for k being the hash-keys of repos collect k)
+                      (list "-name" ".git" "-prune") tests))
+         (default-directory (expand-file-name "repos" ekipage-base-dir))
+         result)
+    (mapc (lambda (repo) (when-let ((package (gethash repo repos)))
+                           (push package result)
+                           (remhash repo repos))) ; Remove to skip duplicates
+          (apply #'process-lines "find" args))
+    result))
+
 (defvar ekipage--cache
-  ;; TODO Allow checking if modified using find(1)
   (let ((cache-file (expand-file-name "cache" ekipage-base-dir)))
     (condition-case nil
         (with-temp-buffer
@@ -167,9 +187,10 @@ Returns the generated autoloads loadable via `eval'."
           ;; TODO Validate ekipage and Emacs version, etc.
           (let ((cache (read (current-buffer))))
             (unless (hash-table-p cache) (signal 'malformed cache))
-            cache)
-          ;; TODO Remove any packages found in "modified" directory
-          )
+            ;; TODO Remove any packages found in "modified" directory
+            (mapc (lambda (package) (remhash package cache))
+                  (ekipage--modified-packages cache))
+            cache))
       (malformed (delete-file cache-file) (make-hash-table))
       (file-missing (make-hash-table)))) ; Proceed with default value
   "Map of up-to-date packages to (RECIPE DEPENDENCIES . AUTOLOADS) tuples.")
@@ -194,7 +215,7 @@ RECIPE is a MELPA style recipe."
   ;; If already built: Just activate
   (pcase (gethash name ekipage--cache)
     ;; TODO Check that recipe is the same
-    (`(,recipe ,deps . ,autoloads)
+    (`(,recipe ,_timestamp ,deps . ,autoloads)
      (dolist (dep deps) (ekipage-use-package (if (consp dep) (car dep) dep)))
      (ekipage--activate-package recipe autoloads)
      (cl-return-from ekipage-use-package)))
@@ -225,7 +246,8 @@ RECIPE is a MELPA style recipe."
 
     (ekipage--activate-package recipe autoloads)
 
-    (puthash name `(,recipe ,deps . ,autoloads) ekipage--cache)
+    (let ((timestamp (format-time-string "%F %T" (time-add nil 1))))
+      (puthash name `(,recipe ,timestamp ,deps . ,autoloads) ekipage--cache))
     (if after-init-time (ekipage--write-cache)
       (add-hook 'after-init-hook #'ekipage--write-cache))))
 
