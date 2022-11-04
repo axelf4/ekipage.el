@@ -2,6 +2,8 @@
 
 (eval-when-compile (require 'cl-lib))
 
+(defgroup ekipage nil "An Emacs Lisp package manager." :group 'applications)
+
 (defcustom ekipage-base-dir
   (expand-file-name "straight" user-emacs-directory)
   "Directory for ekipage data."
@@ -101,17 +103,6 @@ of the destination build directory."
             (_ (signal 'bad-files-directive files))))
         result))
 
-(defun ekipage--activate-package (recipe)
-  "Activate the package built by RECIPE."
-  (let* ((package (plist-get recipe :package))
-         (build-dir (expand-file-name package
-                                      (expand-file-name "build2" ekipage-base-dir)))
-         (autoloads-file (expand-file-name (concat package "-autoloads.el") build-dir)))
-    (message "Activating: %S" recipe)
-    (cl-pushnew build-dir load-path)
-    ;; TODO Cache autoloads to avoid loading file
-    (load autoloads-file nil t)))
-
 ;; TODO Use repos var to unify mono-repo repository in use
 (let ((repos (make-hash-table)))
   (cl-defun ekipage--repo-dir ((&key fetcher repo url &allow-other-keys))
@@ -127,6 +118,8 @@ of the destination build directory."
   (error "TODO"))
 
 (defun ekipage--build-package (package build-dir)
+  "Byte-compiles PACKAGE located in BUILD-DIR.
+Returns the generated autoloads such that they can be loaded with `eval'."
   (let* ((default-directory build-dir) ;; TODO Remove?
          (emacs (concat invocation-directory invocation-name))
          (program (format "(let ((default-directory %S))
@@ -138,11 +131,36 @@ of the destination build directory."
          (autoloads-file (concat package "-autoloads.el")))
     ;; TODO Capture output
     (apply #'call-process emacs nil nil nil args)
-
     ;; Generate autoloads
-    (make-directory-autoloads build-dir autoloads-file)))
+    (make-directory-autoloads build-dir autoloads-file)
+
+    ;; Read generated autoloads
+    ;; TODO Find output files overriden with generated-autoload-file
+    (with-temp-buffer
+      (insert-file-contents-literally autoloads-file)
+      ;; Normalize the $# reader macro
+      (let ((load-file-name autoloads-file) result)
+        (ignore-error end-of-file
+          (while t (push (read (current-buffer)) result)))
+        ;; Fake the autoloads forms being load:ed as usual when eval:ing
+        `(let ((load-file-name ,autoloads-file) (load-in-progress t))
+           ,@(nreverse result))))))
+
+;; TODO Inline?
+(defun ekipage--activate-package (recipe &optional autoloads)
+  "Activate the package built by RECIPE."
+  (let* ((package (plist-get recipe :package))
+         (build-dir (expand-file-name package
+                                      (expand-file-name "build2" ekipage-base-dir)))
+         (autoloads-file (expand-file-name (concat package "-autoloads.el") build-dir)))
+    (message "Activating: %S" recipe)
+    (cl-pushnew build-dir load-path)
+    (if autoloads
+        (eval autoloads) ;; Cache autoloads to avoid loading file
+      (load autoloads-file nil t))))
 
 (defvar ekipage--package-cache
+  ;; TODO Allow checking if modified using find(1)
   (let ((cache-file (expand-file-name "cache" ekipage-base-dir)))
     (condition-case nil
         (with-temp-buffer
@@ -179,17 +197,16 @@ RECIPE is a MELPA style recipe"
    ;; If in cache and not modified: Just activate
    ((pcase (gethash name ekipage--package-cache)
       ;; TODO Check that recipe is the same
-      ;; TODO Allow checking if modified using find(1)
-      (`(,recipe ,deps . ,_autoloads)
+      (`(,recipe ,deps . ,autoloads)
        (dolist (dep deps) (ekipage-use-package (if (consp dep) (car dep) dep)))
-       (ekipage--activate-package recipe)
+       (ekipage--activate-package recipe autoloads)
        t)))
    (t (let* ((recipe (ekipage--normalize-recipe melpa-style-recipe))
              (package (plist-get recipe :package))
              (repo-dir (ekipage--repo-dir recipe))
              (build-dir (expand-file-name
                          package (expand-file-name "build2" ekipage-base-dir)))
-             deps)
+             deps autoloads)
         (unless (file-exists-p repo-dir) (ekipage--clone-package recipe))
 
         (delete-directory build-dir t)
@@ -208,12 +225,12 @@ RECIPE is a MELPA style recipe"
           (ekipage-use-package (if (consp dep) (car dep) dep)))
 
         ;; Build package
-        (message "Compiling package %s..." package)
-        (ekipage--build-package package build-dir)
+        (message "Compiling %s..." package)
+        (setq autoloads (ekipage--build-package package build-dir))
 
-        (ekipage--activate-package recipe)
+        (ekipage--activate-package recipe autoloads)
 
-        (puthash name `(,recipe ,deps . nil) ekipage--package-cache)
+        (puthash name `(,recipe ,deps . ,autoloads) ekipage--package-cache)
         (when after-init-time (ekipage--write-cache))))))
 
 (let* ((recipe (ekipage--normalize-recipe (ekipage-melpa-retrieve 'magit)))
