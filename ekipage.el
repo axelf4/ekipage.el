@@ -4,7 +4,7 @@
 
 (defgroup ekipage nil "An Emacs Lisp package manager." :group 'applications)
 
-(defcustom ekipage-base-dir (expand-file-name "straight" user-emacs-directory)
+(defcustom ekipage-base-dir (expand-file-name "ekipage" user-emacs-directory)
   "Absolute path to the ekipage data directory."
   :type 'string)
 
@@ -154,7 +154,7 @@ Returns the generated autoloads loadable via `eval'."
 (defun ekipage--activate-package (recipe autoloads)
   "Activate the package built by RECIPE."
   (let* ((package (plist-get recipe :package))
-         (build-dir (file-name-concat ekipage-base-dir "build2" package)))
+         (build-dir (file-name-concat ekipage-base-dir "build" package)))
     (cl-pushnew build-dir load-path :test #'string=)
     (eval autoloads))) ;; Cache autoloads to avoid loading file
 
@@ -243,6 +243,9 @@ just (RECIPE) if the package does not get built.")
 (defconst ekipage--ignored-dependencies '(emacs cl-lib cl-generic nadvice seq)
   "Packages to ignore.")
 
+(defvar ekipage--packages-in-use (make-hash-table)
+  "The set of packages that are loaded in this Emacs session.")
+
 ;;;###autoload
 (cl-defun ekipage-use-package
     (melpa-style-recipe &key no-build
@@ -263,7 +266,7 @@ RECIPE is a MELPA style recipe."
   (let* ((recipe (ekipage--normalize-recipe melpa-style-recipe))
          (package (plist-get recipe :package))
          (repo-dir (ekipage--repo-dir recipe))
-         (build-dir (file-name-concat ekipage-base-dir "build2" package))
+         (build-dir (file-name-concat ekipage-base-dir "build" package))
          deps autoloads)
     (unless (file-exists-p repo-dir) (ekipage--clone-package recipe))
 
