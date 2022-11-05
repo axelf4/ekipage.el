@@ -131,7 +131,7 @@ Returns the generated autoloads loadable via `eval'."
          (expr (format "(let ((default-directory %S))
   (normal-top-level-add-subdirs-to-load-path)
   (byte-recompile-directory %S 0 t t))"
-                          (concat build-dir "/..") build-dir))
+                       (file-name-directory build-dir) build-dir))
          (autoloads-file (concat package "-autoloads.el")))
     ;; Byte-compile in subprocess to have a clean environment
     (call-process emacs nil ekipage-byte-compilation-buffer nil
@@ -150,12 +150,31 @@ Returns the generated autoloads loadable via `eval'."
         `(let ((load-file-name ,autoloads-file) (load-in-progress t))
            ,@(nreverse result))))))
 
+(declare-function texinfo-format-buffer-1 "texinfmt")
+(cl-defun ekipage--make-info (build-dir &aux has-info enable-local-variables
+                                        find-file-hook)
+  "Compile Info files from Texinfo sources.
+Returns whether any output files were produced."
+  (dolist (texi-file (directory-files build-dir t "\\.texi\\(?:nfo\\)?$" t) has-info)
+    (require 'texinfmt)
+    (with-current-buffer (find-file-noselect texi-file)
+      (condition-case err
+          (cl-destructuring-bind (info-file . indices) (texinfo-format-buffer-1)
+            (Info-tagify)
+            (Info-split)
+            (call-process "install-info" nil ekipage-byte-compilation-buffer nil
+                          info-file (file-name-concat build-dir "dir")))
+        (:success (setq has-info t))
+        ((error file-missing)
+         (message "Error during texi2info on %s: %S" texi-file err)
+         (set-buffer-modified-p nil))))))
+
 ;; TODO Inline?
 (defun ekipage--activate-package (recipe autoloads)
   "Activate the package built by RECIPE."
   (let* ((package (plist-get recipe :package))
          (build-dir (file-name-concat ekipage-base-dir "build" package)))
-    (cl-pushnew build-dir load-path :test #'string=)
+    (cl-pushnew build-dir load-path :test #'string=) ; TODO Skip later activations to use push
     (eval autoloads))) ;; Cache autoloads to avoid loading file
 
 (defun ekipage--modified-packages (pkg-cache)
@@ -206,6 +225,7 @@ Returns the generated autoloads loadable via `eval'."
                 (cl-loop
                  for k being the hash-keys of cache using (hash-values v) until
                  (cl-destructuring-bind ((&key package &allow-other-keys) . rest) v
+                   ;; TODO Fetch package from repository name
                    (when (string= package modified-pkg) (remhash k cache) t)))))
             cache))
       ((malformed end-of-file) (delete-file cache-file) (make-hash-table))
@@ -288,6 +308,7 @@ RECIPE is a MELPA style recipe."
       ;; Build the package
       (message "Compiling %s..." package)
       (setq autoloads (ekipage--build-package package build-dir))
+      (ekipage--make-info build-dir)
 
       (ekipage--activate-package recipe autoloads)
 
