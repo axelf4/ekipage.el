@@ -111,7 +111,8 @@ of the destination build directory."
        (pcase fetcher
          ((or 'nil 'github 'gitlab)
           (substring repo (1+ (string-match-p "/" repo))))
-         ('git (string-remove-suffix ".git" (file-name-nondirectory url))))
+         ('git (string-remove-suffix ".git" (file-name-nondirectory url)))
+         (_ (error "Unknown :fetcher %s in recipe" fetcher)))
      (expand-file-name "repos" ekipage-base-dir))))
 
 (defun ekipage--clone-package (_recipe)
@@ -164,11 +165,12 @@ Returns the generated autoloads loadable via `eval'."
          (tests
           (cl-loop
            for k being the hash-keys of pkg-cache using (hash-values v) nconc
-           (cl-destructuring-bind (recipe timestamp _deps . autoloads) v
-             (let ((repo (ekipage--repo-dir recipe)))
-               (puthash repo k repos)
-               (list "-o" "-path" (concat repo "/*") "-newermt" timestamp
-                     "-printf" "%H\n" "-prune")))))
+           (pcase v
+             (`(,recipe ,timestamp ,_deps . ,_autoloads)
+              (let ((repo (ekipage--repo-dir recipe)))
+                (puthash repo k repos)
+                (list "-o" "-path" (concat repo "/*") "-newermt" timestamp
+                      "-printf" "%H\n" "-prune"))))))
          (args (nconc (cl-loop for k being the hash-keys of repos collect k)
                       (list "-name" ".git" "-prune") tests))
          (default-directory (expand-file-name "repos" ekipage-base-dir))
@@ -176,7 +178,7 @@ Returns the generated autoloads loadable via `eval'."
     (mapc (lambda (repo) (when-let ((package (gethash repo repos)))
                            (push package result)
                            (remhash repo repos))) ; Remove to skip duplicates
-          (apply #'process-lines "find" args))
+          (when tests (apply #'process-lines "find" args)))
     result))
 
 (defcustom ekipage-check-for-modifications '(check-on-save)
@@ -206,7 +208,9 @@ Returns the generated autoloads loadable via `eval'."
             cache))
       (malformed (delete-file cache-file) (make-hash-table))
       (file-missing (make-hash-table)))) ; Proceed with default value
-  "Map of up-to-date packages to (RECIPE TIMESTAMP DEPENDENCIES . AUTOLOADS) tuples.")
+  "Map of up-to-date packages to their build information.
+The values are (RECIPE TIMESTAMP DEPENDENCIES . AUTOLOADS) tuples, or
+just (RECIPE) if the package does not get built.")
 
 (defun ekipage--write-cache ()
   (with-temp-file (expand-file-name "cache" ekipage-base-dir)
@@ -220,6 +224,7 @@ Returns the generated autoloads loadable via `eval'."
   (if ekipage-check-modifications-mode
       (add-hook 'before-save-hook #'ekipage--register-modification)
     (remove-hook 'before-save-hook #'ekipage--register-modification)))
+(ekipage-check-modifications-mode)
 
 (defun ekipage--register-modification ()
   "If the current buffer visits a file in managed repository, mark it modified."
@@ -238,7 +243,7 @@ Returns the generated autoloads loadable via `eval'."
 
 ;;;###autoload
 (cl-defun ekipage-use-package
-    (melpa-style-recipe
+    (melpa-style-recipe &key no-build
      &aux (name (if (listp melpa-style-recipe) (car melpa-style-recipe) melpa-style-recipe)))
   "Do thing.
 RECIPE is a MELPA style recipe."
@@ -247,6 +252,7 @@ RECIPE is a MELPA style recipe."
   ;; If already built: Just activate
   (pcase (gethash name ekipage--cache)
     ;; TODO Check that recipe is the same
+    (`(,_recipe) (cl-return-from ekipage-use-package)) ; no-build package
     (`(,recipe ,_timestamp ,deps . ,autoloads)
      (dolist (dep deps) (ekipage-use-package (if (consp dep) (car dep) dep)))
      (ekipage--activate-package recipe autoloads)
@@ -260,27 +266,30 @@ RECIPE is a MELPA style recipe."
          deps autoloads)
     (unless (file-exists-p repo-dir) (ekipage--clone-package recipe))
 
-    (delete-directory build-dir t)
-    (make-directory build-dir t)
-    ;; Symlink files used to build the package
-    (cl-loop
-     with default-directory = build-dir
-     for (srcfile . dst-dir)
-     in (ekipage--calc-symlinks (plist-get recipe :files) repo-dir) do
-     (make-symbolic-link
-      (expand-file-name srcfile repo-dir)
-      (if (string= dst-dir "") "./" (make-directory dst-dir t) dst-dir) t))
-    ;; Ensure dependencies are built
-    (setq deps (ekipage--dependencies package build-dir))
-    (dolist (dep deps) (ekipage-use-package (if (consp dep) (car dep) dep)))
-    ;; Build the package
-    (message "Compiling %s..." package)
-    (setq autoloads (ekipage--build-package package build-dir))
+    (if no-build
+        (puthash name (list recipe) ekipage--cache)
+      (delete-directory build-dir t)
+      (make-directory build-dir t)
+      ;; Symlink files used to build the package
+      (cl-loop
+       with default-directory = build-dir
+       for (srcfile . dst-dir)
+       in (ekipage--calc-symlinks (plist-get recipe :files) repo-dir) do
+       (make-symbolic-link
+        (expand-file-name srcfile repo-dir)
+        (if (string= dst-dir "") "./" (make-directory dst-dir t) dst-dir) t))
+      ;; Ensure dependencies are built
+      (setq deps (ekipage--dependencies package build-dir))
+      (dolist (dep deps) (ekipage-use-package (if (consp dep) (car dep) dep)))
+      ;; Build the package
+      (message "Compiling %s..." package)
+      (setq autoloads (ekipage--build-package package build-dir))
 
-    (ekipage--activate-package recipe autoloads)
+      (ekipage--activate-package recipe autoloads)
 
-    (let ((timestamp (format-time-string "%F %T" (time-add nil 1))))
-      (puthash name `(,recipe ,timestamp ,deps . ,autoloads) ekipage--cache))
+      (let ((timestamp (format-time-string "%F %T" (time-add nil 1))))
+        (puthash name `(,recipe ,timestamp ,deps . ,autoloads) ekipage--cache)))
+
     (if after-init-time (ekipage--write-cache)
       (add-hook 'after-init-hook #'ekipage--write-cache))))
 
