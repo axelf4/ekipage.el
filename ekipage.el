@@ -155,7 +155,7 @@ Returns the generated autoloads loadable via `eval'."
   (let* ((package (plist-get recipe :package))
          (build-dir (expand-file-name package
                                       (expand-file-name "build2" ekipage-base-dir))))
-    (cl-pushnew build-dir load-path)
+    (cl-pushnew build-dir load-path :test #'string=)
     (eval autoloads))) ;; Cache autoloads to avoid loading file
 
 (defun ekipage--modified-packages (pkg-cache)
@@ -179,27 +179,59 @@ Returns the generated autoloads loadable via `eval'."
           (apply #'process-lines "find" args))
     result))
 
+(defcustom ekipage-check-for-modifications '(check-on-save)
+  "How to check for modifications.")
+
 (defvar ekipage--cache
   (let ((cache-file (expand-file-name "cache" ekipage-base-dir)))
     (condition-case nil
         (with-temp-buffer
           (insert-file-contents cache-file)
           ;; TODO Validate ekipage and Emacs version, etc.
-          (let ((cache (read (current-buffer))))
+          (let ((cache (read (current-buffer)))
+                (modified-dir (expand-file-name "modified" ekipage-base-dir)))
             (unless (hash-table-p cache) (signal 'malformed cache))
-            ;; TODO Remove any packages found in "modified" directory
-            (mapc (lambda (package) (remhash package cache))
-                  (ekipage--modified-packages cache))
+            (if (memq 'find-at-startup ekipage-check-for-modifications)
+                (dolist (package (ekipage--modified-packages cache))
+                  (remhash package cache))
+              ;; Remove any packages recorded in "modified" directory
+              (dolist (modified-pkg
+                       (when (file-exists-p modified-dir)
+                         (directory-files modified-dir nil
+                                          directory-files-no-dot-files-regexp t)))
+                (cl-loop
+                 for k being the hash-keys of cache using (hash-values v) until
+                 (cl-destructuring-bind ((&key package &allow-other-keys) . rest) v
+                   (when (string= package modified-pkg) (remhash k cache) t)))))
             cache))
       (malformed (delete-file cache-file) (make-hash-table))
       (file-missing (make-hash-table)))) ; Proceed with default value
-  "Map of up-to-date packages to (RECIPE DEPENDENCIES . AUTOLOADS) tuples.")
+  "Map of up-to-date packages to (RECIPE TIMESTAMP DEPENDENCIES . AUTOLOADS) tuples.")
 
 (defun ekipage--write-cache ()
-  ;; TODO Remove "modified" packages directory afterward
   (with-temp-file (expand-file-name "cache" ekipage-base-dir)
     (let (print-length print-level)
-      (print ekipage--cache (current-buffer)))))
+      (print ekipage--cache (current-buffer))))
+  (delete-directory (expand-file-name "modified" ekipage-base-dir) t))
+
+(define-minor-mode ekipage-check-modifications-mode
+  "Mode that records modifications to package repositories managed by ekipage.el."
+  :global t
+  (if ekipage-check-modifications-mode
+      (add-hook 'before-save-hook #'ekipage--register-modification)
+    (remove-hook 'before-save-hook #'ekipage--register-modification)))
+
+(defun ekipage--register-modification ()
+  "If the current buffer visits a file in managed repository, mark it modified."
+  (when-let* (buffer-file-name
+              (repos-dir (file-name-as-directory
+                          (expand-file-name "repos" ekipage-base-dir)))
+              ((string-prefix-p repos-dir buffer-file-name
+                                (file-name-case-insensitive-p repos-dir)))
+              (slash-pos (string-match-p "/" buffer-file-name (length repos-dir)))
+              (repo (substring buffer-file-name (length repos-dir) slash-pos))
+              (modified-dir (expand-file-name "modified" ekipage-base-dir)))
+    (make-empty-file (expand-file-name repo modified-dir) t)))
 
 (defconst ekipage--ignored-dependencies '(emacs cl-lib cl-generic nadvice seq)
   "Packages to ignore.")
@@ -231,12 +263,13 @@ RECIPE is a MELPA style recipe."
     (delete-directory build-dir t)
     (make-directory build-dir t)
     ;; Symlink files used to build the package
-    (cl-loop with default-directory = build-dir
-             for (srcfile . dst-dir)
-             in (ekipage--calc-symlinks (plist-get recipe :files) repo-dir) do
-             (make-symbolic-link
-              (expand-file-name srcfile repo-dir)
-              (if (string= dst-dir "") "./" (make-directory dst-dir t) dst-dir) t))
+    (cl-loop
+     with default-directory = build-dir
+     for (srcfile . dst-dir)
+     in (ekipage--calc-symlinks (plist-get recipe :files) repo-dir) do
+     (make-symbolic-link
+      (expand-file-name srcfile repo-dir)
+      (if (string= dst-dir "") "./" (make-directory dst-dir t) dst-dir) t))
     ;; Ensure dependencies are built
     (setq deps (ekipage--dependencies package build-dir))
     (dolist (dep deps) (ekipage-use-package (if (consp dep) (car dep) dep)))
