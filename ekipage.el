@@ -4,32 +4,32 @@
 
 (defgroup ekipage nil "An Emacs Lisp package manager." :group 'applications)
 
-(defcustom ekipage-base-dir
-  (expand-file-name "straight" user-emacs-directory)
-  "Directory for ekipage data."
+(defcustom ekipage-base-dir (expand-file-name "straight" user-emacs-directory)
+  "Absolute path to the ekipage data directory."
   :type 'string)
 
 (defun ekipage--melpa-retrieve (package)
   "Look up the MELPA recipe for PACKAGE."
-  (let ((melpa-repo (expand-file-name "repos/melpa/recipes" ekipage-base-dir)))
-    (with-temp-buffer
-      (condition-case nil
-          (insert-file-contents-literally
-           (expand-file-name (symbol-name package) melpa-repo))
-        (file-missing nil)
-        (:success
-         (cl-destructuring-bind (name . recipe) (read (current-buffer))
-           (when-let ((tail (cdr (plist-member recipe :files))))
-             ;; Ensure *-pkg.el is included (may be implicit as MELPA always creates it)
-             (setcar tail (append (car tail) (list (format "%s-pkg.el" name)))))
-           ;; TODO Normalize MELPA style recipe, e.g. default to git fetcher
-           (cons name recipe)))))))
+  (with-temp-buffer
+    (condition-case nil
+        (insert-file-contents-literally
+         (file-name-concat ekipage-base-dir "repos" "melpa" "recipes"
+                           (symbol-name package)))
+      (file-missing nil)
+      (:success
+       (cl-destructuring-bind (name . recipe) (read (current-buffer))
+         (when-let ((tail (cdr (plist-member recipe :files))))
+           ;; Ensure *-pkg.el is included (may be implicit as MELPA always creates it)
+           (setcar tail (append (car tail) (list (format "%s-pkg.el" name)))))
+         ;; TODO Normalize MELPA style recipe, e.g. default to git fetcher
+         (cons name recipe))))))
 
 (defun ekipage--gnu-elpa-retrieve (package)
-  (let ((elpa-repo (expand-file-name "repos/gnu-elpa-mirror" ekipage-base-dir)))
-    (when (file-exists-p (expand-file-name (symbol-name package) elpa-repo))
-      (list package :fetcher 'github :repo (format "emacs-straight/%s" package)
-            :files '("*" (:exclude ".git"))))))
+  (when (file-exists-p
+         (file-name-concat
+          ekipage-base-dir "repos" "gnu-elpa-mirror" (symbol-name package)))
+    (list package :fetcher 'github :repo (format "emacs-straight/%s" package)
+          :files '("*" (:exclude ".git")))))
 
 ;; TODO Remove and require user recipes to include :package key
 (defun ekipage--normalize-recipe (melpa-style-recipe)
@@ -107,13 +107,13 @@ of the destination build directory."
 (let ((_repos (make-hash-table :test #'equal)))
   (cl-defun ekipage--repo-dir ((&key fetcher repo url &allow-other-keys))
     "Return the repository directory for the package built by RECIPE."
-    (expand-file-name
-       (pcase fetcher
-         ((or 'nil 'github 'gitlab)
-          (substring repo (1+ (string-match-p "/" repo))))
-         ('git (string-remove-suffix ".git" (file-name-nondirectory url)))
-         (_ (error "Unknown :fetcher %s in recipe" fetcher)))
-     (expand-file-name "repos" ekipage-base-dir))))
+    (file-name-concat
+     ekipage-base-dir "repos"
+     (pcase fetcher
+       ((or 'nil 'github 'gitlab)
+        (substring repo (1+ (string-match-p "/" repo))))
+       ('git (string-remove-suffix ".git" (file-name-nondirectory url)))
+       (_ (error "Unknown :fetcher %s in recipe" fetcher))))))
 
 (defun ekipage--clone-package (_recipe)
   (error "TODO"))
@@ -154,8 +154,7 @@ Returns the generated autoloads loadable via `eval'."
 (defun ekipage--activate-package (recipe autoloads)
   "Activate the package built by RECIPE."
   (let* ((package (plist-get recipe :package))
-         (build-dir (expand-file-name package
-                                      (expand-file-name "build2" ekipage-base-dir))))
+         (build-dir (file-name-concat ekipage-base-dir "build2" package)))
     (cl-pushnew build-dir load-path :test #'string=)
     (eval autoloads))) ;; Cache autoloads to avoid loading file
 
@@ -169,11 +168,12 @@ Returns the generated autoloads loadable via `eval'."
              (`(,recipe ,timestamp ,_deps . ,_autoloads)
               (let ((repo (ekipage--repo-dir recipe)))
                 (puthash repo k repos)
-                (list "-o" "-path" (concat repo "/*") "-newermt" timestamp
+                (list "-o" "-path" (concat repo "/*")
+                      "-newermt" (format-time-string "%F %T" timestamp)
                       "-printf" "%H\n" "-prune"))))))
          (args (nconc (cl-loop for k being the hash-keys of repos collect k)
                       (list "-name" ".git" "-prune") tests))
-         (default-directory (expand-file-name "repos" ekipage-base-dir))
+         (default-directory (file-name-concat ekipage-base-dir "repos"))
          result)
     (mapc (lambda (repo) (when-let ((package (gethash repo repos)))
                            (push package result)
@@ -185,14 +185,16 @@ Returns the generated autoloads loadable via `eval'."
   "How to check for modifications.")
 
 (defvar ekipage--cache
-  (let ((cache-file (expand-file-name "cache" ekipage-base-dir)))
+  (let ((cache-file (file-name-concat ekipage-base-dir "cache")))
     (condition-case nil
         (with-temp-buffer
           (insert-file-contents cache-file)
-          ;; TODO Validate ekipage and Emacs version, etc.
-          (let ((cache (read (current-buffer)))
-                (modified-dir (expand-file-name "modified" ekipage-base-dir)))
-            (unless (hash-table-p cache) (signal 'malformed cache))
+          (let ((cache-emacs-version (read (current-buffer)))
+                (cache (read (current-buffer)))
+                (modified-dir (file-name-concat ekipage-base-dir "modified")))
+            (unless (and (equal cache-emacs-version emacs-version)
+                         (hash-table-p cache))
+              (signal 'malformed cache))
             (if (memq 'find-at-startup ekipage-check-for-modifications)
                 (dolist (package (ekipage--modified-packages cache))
                   (remhash package cache))
@@ -206,17 +208,18 @@ Returns the generated autoloads loadable via `eval'."
                  (cl-destructuring-bind ((&key package &allow-other-keys) . rest) v
                    (when (string= package modified-pkg) (remhash k cache) t)))))
             cache))
-      (malformed (delete-file cache-file) (make-hash-table))
+      ((malformed end-of-file) (delete-file cache-file) (make-hash-table))
       (file-missing (make-hash-table)))) ; Proceed with default value
   "Map of up-to-date packages to their build information.
 The values are (RECIPE TIMESTAMP DEPENDENCIES . AUTOLOADS) tuples, or
 just (RECIPE) if the package does not get built.")
 
 (defun ekipage--write-cache ()
-  (with-temp-file (expand-file-name "cache" ekipage-base-dir)
+  (with-temp-file (file-name-concat ekipage-base-dir "cache")
     (let (print-length print-level)
+      (print emacs-version (current-buffer))
       (print ekipage--cache (current-buffer))))
-  (delete-directory (expand-file-name "modified" ekipage-base-dir) t))
+  (delete-directory (file-name-concat ekipage-base-dir "modified") t))
 
 (define-minor-mode ekipage-check-modifications-mode
   "Mode that records modifications to package repositories managed by ekipage.el."
@@ -230,13 +233,12 @@ just (RECIPE) if the package does not get built.")
   "If the current buffer visits a file in managed repository, mark it modified."
   (when-let* (buffer-file-name
               (repos-dir (file-name-as-directory
-                          (expand-file-name "repos" ekipage-base-dir)))
+                          (file-name-concat ekipage-base-dir "repos")))
               ((string-prefix-p repos-dir buffer-file-name
                                 (file-name-case-insensitive-p repos-dir)))
               (slash-pos (string-match-p "/" buffer-file-name (length repos-dir)))
-              (repo (substring buffer-file-name (length repos-dir) slash-pos))
-              (modified-dir (expand-file-name "modified" ekipage-base-dir)))
-    (make-empty-file (expand-file-name repo modified-dir) t)))
+              (repo (substring buffer-file-name (length repos-dir) slash-pos)))
+    (make-empty-file (file-name-concat ekipage-base-dir "modified" repo) t)))
 
 (defconst ekipage--ignored-dependencies '(emacs cl-lib cl-generic nadvice seq)
   "Packages to ignore.")
@@ -261,8 +263,7 @@ RECIPE is a MELPA style recipe."
   (let* ((recipe (ekipage--normalize-recipe melpa-style-recipe))
          (package (plist-get recipe :package))
          (repo-dir (ekipage--repo-dir recipe))
-         (build-dir (expand-file-name
-                     package (expand-file-name "build2" ekipage-base-dir)))
+         (build-dir (file-name-concat ekipage-base-dir "build2" package))
          deps autoloads)
     (unless (file-exists-p repo-dir) (ekipage--clone-package recipe))
 
@@ -276,7 +277,7 @@ RECIPE is a MELPA style recipe."
        for (srcfile . dst-dir)
        in (ekipage--calc-symlinks (plist-get recipe :files) repo-dir) do
        (make-symbolic-link
-        (expand-file-name srcfile repo-dir)
+        (file-name-concat repo-dir srcfile)
         (if (string= dst-dir "") "./" (make-directory dst-dir t) dst-dir) t))
       ;; Ensure dependencies are built
       (setq deps (ekipage--dependencies package build-dir))
@@ -287,8 +288,7 @@ RECIPE is a MELPA style recipe."
 
       (ekipage--activate-package recipe autoloads)
 
-      (let ((timestamp (format-time-string "%F %T" (time-add nil 1))))
-        (puthash name `(,recipe ,timestamp ,deps . ,autoloads) ekipage--cache)))
+      (puthash name `(,recipe ,(time-add nil 1) ,deps . ,autoloads) ekipage--cache))
 
     (if after-init-time (ekipage--write-cache)
       (add-hook 'after-init-hook #'ekipage--write-cache))))
