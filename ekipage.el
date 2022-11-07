@@ -39,7 +39,7 @@
   "Default value for the `:files' directive in recipes.")
 
 (defun ekipage--expand-files (files src-dir)
-  "Determines the files used to build the package from its `:files' directive.
+  "Determine the files used to build the package from its `:files' directive.
 Returns a list of (SRCPATH . DST-SUBDIR) pairs where SRCPATH is a file
 relative to SRC-DIR that should be copied the DST-SUBDIR subdirectory
 of the destination build directory."
@@ -71,18 +71,9 @@ of the destination build directory."
             (_ (signal 'bad-files-directive files))))
         result))
 
-;; TODO Use repos var to unify mono-repo repository in use
-(let ((_repos (make-hash-table :test 'equal)))
-  (cl-defun ekipage--repo ((&key fetcher repo url &allow-other-keys))
-    "Return the repository directory for the package built by RECIPE."
-    (pcase fetcher
-      ((or 'nil 'github 'gitlab)
-       (substring repo (1+ (string-match-p "/" repo))))
-      ('git (string-remove-suffix ".git" (file-name-nondirectory url)))
-      (_ (error "Unknown :fetcher %s in recipe" fetcher)))))
-
 (defun ekipage--melpa-retrieve (package)
   "Look up the MELPA recipe for PACKAGE."
+  (ekipage-use-package '(melpa :fetcher github :repo "melpa/melpa") :no-build t)
   (with-temp-buffer
     (condition-case nil
         (insert-file-contents-literally
@@ -94,35 +85,51 @@ of the destination build directory."
          (when-let ((tail (cdr (plist-member recipe :files))))
            ;; Ensure *-pkg.el is included (may be implicit as MELPA always creates it)
            (setcar tail (append (car tail) (list (format "%s-pkg.el" name)))))
-         ;; TODO Normalize MELPA style recipe, e.g. default to git fetcher
          (cons name recipe))))))
 
 (defun ekipage--gnu-elpa-retrieve (package)
   "Look up the GNU Elpa recipe for PACKAGE."
+  (ekipage-use-package
+   '(melpa :fetcher github :repo "emacs-straight/gnu-elpa-mirror") :no-build t)
   (when (file-exists-p
          (file-name-concat
           ekipage-base-dir "repos" "gnu-elpa-mirror" (symbol-name package)))
     (list package :fetcher 'github :repo (format "emacs-straight/%s" package)
           :files '("*" (:exclude ".git")))))
 
+;; TODO Use repos var to unify mono-repo repository in use
+;; (let ((_repos (make-hash-table :test 'equal))))
 (defun ekipage--normalize-recipe (melpa-style-recipe)
-  (cl-destructuring-bind (package . recipe)
+  (cl-destructuring-bind (package &rest recipe &key fetcher repo url &allow-other-keys)
       (if (listp melpa-style-recipe)
           (copy-sequence melpa-style-recipe)
         (or (ekipage--melpa-retrieve melpa-style-recipe)
             (ekipage--gnu-elpa-retrieve melpa-style-recipe)
             (error "Recipe for package %s not found" melpa-style-recipe)))
     (setq recipe (plist-put recipe :package (symbol-name package)))
-    (setq recipe (plist-put recipe :local-repo (ekipage--repo recipe)))
+    (let ((repo (pcase fetcher
+                  ((or 'nil 'github 'gitlab)
+                   (substring repo (1+ (string-match-p "/" repo))))
+                  ('git (string-remove-suffix ".git" (file-name-nondirectory url)))
+                  (_ (symbol-name package)))))
+      (setq recipe (plist-put recipe :local-repo repo)))
     recipe))
-
-(defun ekipage--clone-package (_recipe)
-  (error "TODO"))
 
 (defcustom ekipage-byte-compilation-buffer "*ekipage-byte-compilation*"
   "Name of the byte-compilation log buffer, or nil to discard output."
   :type '(choice (string :tag "Buffer name")
                  (const :tag "Discard output" nil)))
+
+(cl-defun ekipage--clone-package
+    ((&key package fetcher repo url &allow-other-keys) repo-dir)
+  (make-directory repo-dir t)
+  (let ((url (pcase fetcher
+               ('git url)
+               ('github (format "https://github.com/%s.git" repo))
+               ('gitlab (format "https://gitlab.com/%s.git" repo))
+               (_ (error "Unknown fetcher %S for package %s" fetcher package)))))
+    (call-process "git" nil ekipage-byte-compilation-buffer nil
+                  "clone" "--depth" "1" "--no-single-branch" "--" url repo-dir)))
 
 (defun ekipage--build-package (package build-dir)
   "Byte-compile PACKAGE inside of BUILD-DIR.
@@ -232,8 +239,7 @@ just (RECIPE DEPENDENCIES) for clone-only packages.")
             ekipage--cache)
            changed)))
 
-;; Invalidate stale packages in cache
-(when-let*
+(when-let* ; Invalidate stale packages in cache
     ((modified-dir (file-name-concat ekipage-base-dir "modified"))
      (modified
       (if (memq 'find-at-startup ekipage-check-for-modifications)
@@ -248,7 +254,7 @@ just (RECIPE DEPENDENCIES) for clone-only packages.")
          (when (file-exists-p modified-dir)
            (directory-files
             modified-dir nil directory-files-no-dot-files-regexp t))))))
-  ;; TODO Check if recipe from modified recipe repository changed
+  ;; TODO Check if recipes from modified recipe repository changed
   (dolist (package modified) (remhash package ekipage--cache))
   (ekipage--invalidate-dependents))
 
@@ -281,30 +287,34 @@ just (RECIPE DEPENDENCIES) for clone-only packages.")
 (defvar ekipage--activated-packages (make-hash-table :test 'eq)
   "The set of packages that are loaded in this Emacs session.")
 
-(defun ekipage--activate-package (name recipe autoloads)
+(defun ekipage--activate-package (name build-dir autoloads)
   "Activate the package built by RECIPE."
   (unless (gethash name ekipage--activated-packages)
     (puthash name t ekipage--activated-packages)
-    (let* ((package (plist-get recipe :package))
-           (build-dir (file-name-concat ekipage-base-dir "build" package)))
-      (push build-dir load-path)
-      (eval autoloads)))) ;; Cache autoloads to avoid loading file
+    (push build-dir load-path)
+    (eval autoloads))) ; Cache autoloads to avoid loading file
 
 ;;;###autoload
 (cl-defun ekipage-use-package
-    (melpa-style-recipe &key no-build
-                        &aux (name (if (listp melpa-style-recipe) (car melpa-style-recipe) melpa-style-recipe)))
+    (melpa-style-recipe
+     &key no-build
+     &aux (name (if (listp melpa-style-recipe) (car melpa-style-recipe) melpa-style-recipe)))
   "Do thing.
 RECIPE is a MELPA style recipe."
   (and (symbolp melpa-style-recipe) (memq name ekipage--ignored-dependencies)
        (cl-return-from ekipage-use-package))
   (pcase (gethash name ekipage--cache)
     ;; TODO Check that recipe is the same
-    (`(,_recipe ,_deps) (cl-return-from ekipage-use-package)) ; no-build package
     ;; If already built: Just activate
-    (`(,recipe ,deps ,_timestamp . ,autoloads)
-     (dolist (dep deps) (ekipage-use-package (if (consp dep) (car dep) dep)))
-     (ekipage--activate-package name recipe autoloads)
+    ((and (or (and `(,recipe ,deps ,_timestamp . ,autoloads)
+                   (let build-dir (file-name-concat ekipage-base-dir "build"
+                                                    (plist-get recipe :package)))
+                   (guard (file-exists-p build-dir)))
+              `(,recipe ,deps)) ; clone-only package
+          (guard (file-exists-p (file-name-concat ekipage-base-dir "repos"
+                                                  (plist-get recipe :local-repo)))))
+     (pcase-dolist ((or `(,dep ,_) dep) deps) (ekipage-use-package dep))
+     (when build-dir (ekipage--activate-package name build-dir autoloads))
      (cl-return-from ekipage-use-package))
     ;; About to rebuild: Invalidate packages that may later use this package
     (_ (remhash name ekipage--cache) (ekipage--invalidate-dependents)))
@@ -315,7 +325,7 @@ RECIPE is a MELPA style recipe."
                                      (plist-get recipe :local-repo)))
          (build-dir (file-name-concat ekipage-base-dir "build" package))
          deps autoloads)
-    (unless (file-exists-p repo-dir) (ekipage--clone-package recipe))
+    (unless (file-exists-p repo-dir) (ekipage--clone-package recipe repo-dir))
 
     (if no-build
         (puthash name (list recipe nil) ekipage--cache)
@@ -329,14 +339,14 @@ RECIPE is a MELPA style recipe."
         (file-name-concat repo-dir srcfile)
         (if (string-empty-p dst-dir) "./" (make-directory dst-dir t) dst-dir) t))
       ;; Ensure dependencies are built
-      (dolist (dep (setq deps (ekipage--dependencies package build-dir)))
-        (ekipage-use-package (if (consp dep) (car dep) dep)))
+      (setq deps (ekipage--dependencies package build-dir))
+      (pcase-dolist ((or `(,dep ,_) dep) deps) (ekipage-use-package dep))
       ;; Build the package
       (message "Compiling %s..." package)
       (setq autoloads (ekipage--build-package package build-dir))
       (ekipage--make-info build-dir)
 
-      (ekipage--activate-package name recipe autoloads)
+      (ekipage--activate-package name build-dir autoloads)
 
       (puthash name `(,recipe ,deps ,(time-add nil 1) . ,autoloads) ekipage--cache))
 
