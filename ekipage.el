@@ -59,7 +59,7 @@ of the destination build directory."
                        (nconc (mapcar (lambda (x) (cons x dir)) xs) result))))
              (pop (cdar stack)))
             (`(,_) (setq exclude nil) (pop stack))
-            ;; Nested SUBDIR/:exclude inside of :exclude: Flatten
+            ;; Flatten nested SUBDIR/:exclude inside of :exclude
             ((and (guard exclude) `(,_ (,_ . ,srcpaths) . ,rest))
              (setf (cdar stack) (append srcpaths rest)))
             (`(,dir (,(and (pred stringp) subdir) . ,srcpaths) . ,rest)
@@ -121,15 +121,19 @@ of the destination build directory."
                  (const :tag "Discard output" nil)))
 
 (cl-defun ekipage--clone-package
-    ((&key package fetcher repo url &allow-other-keys) repo-dir)
+    ((&key package local-repo fetcher repo url branch &allow-other-keys) repo-dir)
+  (message "Cloning %s into %s..." package local-repo)
   (make-directory repo-dir t)
   (let ((url (pcase fetcher
                ('git url)
                ('github (format "https://github.com/%s.git" repo))
                ('gitlab (format "https://gitlab.com/%s.git" repo))
                (_ (error "Unknown fetcher %S for package %s" fetcher package)))))
-    (call-process "git" nil ekipage-byte-compilation-buffer nil
-                  "clone" "--depth" "1" "--no-single-branch" "--" url repo-dir)))
+    (apply #'call-process "git" nil ekipage-byte-compilation-buffer nil
+           ;; Use "origin" regardless of clone.defaultRemoteName from user config
+           "clone" "--origin" "origin" "--depth" "1" "--no-single-branch"
+           `(,@(when branch (list "--branch" branch))
+             "--" ,url ,repo-dir))))
 
 (defun ekipage--build-package (package build-dir)
   "Byte-compile PACKAGE inside of BUILD-DIR.
@@ -211,7 +215,7 @@ just (RECIPE DEPENDENCIES) for clone-only packages.")
              (`(,recipe ,_deps ,timestamp . ,_autoloads)
               (let ((repo (plist-get recipe :local-repo)))
                 (puthash repo (cons k (gethash repo repos)) repos)
-                (list "-o" "-path" (concat repo "/*")
+                (list "-o" "-path" (concat repo "*")
                       "-newermt" (format-time-string "%F %T" timestamp)
                       "-printf" "%H\n" "-prune"))))))
          (args (nconc (cl-loop for k being the hash-keys of repos collect k)
@@ -230,12 +234,12 @@ just (RECIPE DEPENDENCIES) for clone-only packages.")
            (maphash
             (cl-function
              (lambda (package (_recipe deps . rest))
-               (cl-loop
-                for dep in deps
-                unless (let ((dep-pkg (if (consp dep) (car dep) dep)))
-                         (or (memq dep-pkg ekipage--ignored-dependencies)
-                             (gethash dep-pkg ekipage--cache)))
-                do (remhash package ekipage--cache) and return (setq changed t))))
+               (unless (cl-loop
+                        for dep in deps always
+                        (let ((dep-pkg (if (consp dep) (car dep) dep)))
+                          (or (memq dep-pkg ekipage--ignored-dependencies)
+                              (gethash dep-pkg ekipage--cache))))
+                 (remhash package ekipage--cache) (setq changed t))))
             ekipage--cache)
            changed)))
 
@@ -249,8 +253,7 @@ just (RECIPE DEPENDENCIES) for clone-only packages.")
          (lambda (modified-repo)
            (cl-loop
             for k being the hash-keys of ekipage--cache using (hash-values v)
-            if (string= (plist-get (car v) :local-repo) modified-repo)
-            return k))
+            if (string= (plist-get (car v) :local-repo) modified-repo) return k))
          (when (file-exists-p modified-dir)
            (directory-files
             modified-dir nil directory-files-no-dot-files-regexp t))))))
@@ -271,7 +274,6 @@ just (RECIPE DEPENDENCIES) for clone-only packages.")
   (if ekipage-check-modifications-mode
       (add-hook 'before-save-hook #'ekipage--register-modification)
     (remove-hook 'before-save-hook #'ekipage--register-modification)))
-(ekipage-check-modifications-mode)
 
 (defun ekipage--register-modification ()
   "If the current buffer visits a file in a managed repository, mark it modified."
@@ -292,6 +294,7 @@ just (RECIPE DEPENDENCIES) for clone-only packages.")
   (unless (gethash name ekipage--activated-packages)
     (puthash name t ekipage--activated-packages)
     (push build-dir load-path)
+    ;; TODO Add build-dir to Info-directory-list once it is initialized
     (eval autoloads))) ; Cache autoloads to avoid loading file
 
 ;;;###autoload
@@ -304,7 +307,23 @@ RECIPE is a MELPA style recipe."
   (and (symbolp melpa-style-recipe) (memq name ekipage--ignored-dependencies)
        (cl-return-from ekipage-use-package))
   (pcase (gethash name ekipage--cache)
-    ;; TODO Check that recipe is the same
+    ;; If manually specified recipe differs from cache: Rebuild if possible
+    ((and (let `(,_name . ,manual-recipe) melpa-style-recipe) `(,recipe . ,_)
+          ;; Since recipes proplists are never shuffled, discrepancies
+          ;; may be found by iterating both proplists in lockstep.
+          (guard (cl-loop
+                  with as = manual-recipe for bs on recipe by #'cddr finally return as
+                  if (eq (car as) (car bs))
+                  unless (equal (cadr as) (cadr bs)) return t end
+                  and do (setq as (cddr as))
+                  else unless (memq (car bs) '(:package :local-repo)) return t)))
+     ;; Invalidate other packages built from repository in old recipe
+     ;; regardless of whether repository details changed.
+     (let ((old-repo (plist-get recipe :local-repo)))
+       (maphash (cl-function
+                 (lambda (k ((&key local-repo &allow-other-keys) . rest))
+                   (when (string= local-repo old-repo) (remhash k ekipage--cache))))
+                ekipage--cache)))
     ;; If already built: Just activate
     ((and (or (and `(,recipe ,deps ,_timestamp . ,autoloads)
                    (let build-dir (file-name-concat ekipage-base-dir "build"
@@ -315,9 +334,12 @@ RECIPE is a MELPA style recipe."
                                                   (plist-get recipe :local-repo)))))
      (pcase-dolist ((or `(,dep ,_) dep) deps) (ekipage-use-package dep))
      (when build-dir (ekipage--activate-package name build-dir autoloads))
-     (cl-return-from ekipage-use-package))
-    ;; About to rebuild: Invalidate packages that may later use this package
-    (_ (remhash name ekipage--cache) (ekipage--invalidate-dependents)))
+     (cl-return-from ekipage-use-package)))
+  ;; About to rebuild: Invalidate packages that may later use this package
+  (when (gethash name ekipage--cache)
+    (when (gethash name ekipage--activated-packages)
+      (error "Tried to rebuild package %s which is already loaded. Impossible as it is to unload a package you will have to restart Emacs before proceeding." name))
+    (remhash name ekipage--cache) (ekipage--invalidate-dependents))
 
   (let* ((recipe (ekipage--normalize-recipe melpa-style-recipe))
          (package (plist-get recipe :package))

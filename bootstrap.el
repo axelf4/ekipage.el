@@ -1,4 +1,6 @@
-;;; bootstrap.el --- Bootstrap script for ekipage.el  -*- lexical-binding: t -*-
+;;; bootstrap.el --- Initializes ekipage.el  -*- lexical-binding: t -*-
+
+(require 'bytecomp)
 
 (let* ((bootstrap.el (file-truename load-file-name))
        (ekipage.el (expand-file-name "ekipage.el"
@@ -7,3 +9,6 @@
   (load (file-name-sans-extension ekipage.el) nil t))
 
 (ekipage-use-package '(ekipage :fetcher github :repo "axelf4/ekipage") :no-build t)
+
+(unless (memq 'find-at-startup ekipage-check-for-modifications)
+  (ekipage-check-modifications-mode))
