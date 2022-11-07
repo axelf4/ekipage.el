@@ -10,22 +10,21 @@
   "Absolute path to the ekipage data directory."
   :type 'string)
 
-(defun ekipage--dependencies (package build-dir)
+(cl-defun ekipage--dependencies
+    (package build-dir &aux (default-directory build-dir) (case-fold-search t))
   "Return the dependencies of PACKAGE."
-  (let ((default-directory build-dir)
-        (case-fold-search t))
-    (with-temp-buffer
-      (condition-case nil
-          ;; Either from <PACKAGE>-pkg.el metadata
-          (insert-file-contents-literally (concat package "-pkg.el"))
-        (:success (eval (nth 4 (read (current-buffer)))))
-        (file-missing
-         ;; Or the <PACKAGE>.el preamble
-         (and (ignore-error file-missing
-                (insert-file-contents-literally (concat package ".el")))
-              (re-search-forward
-               "[[:space:]]*;+[[:space:]]*Package-Requires:[[:space:]]*" nil t)
-              (read (current-buffer))))))))
+  (with-temp-buffer
+    (condition-case nil
+        ;; Either from <PACKAGE>-pkg.el metadata
+        (insert-file-contents-literally (concat package "-pkg.el"))
+      (:success (eval (nth 4 (read (current-buffer)))))
+      (file-missing
+       ;; Or the <PACKAGE>.el preamble
+       (and (ignore-error file-missing
+              (insert-file-contents-literally (concat package ".el")))
+            (re-search-forward
+             "[[:space:]]*;+[[:space:]]*Package-Requires:[[:space:]]*" nil t)
+            (read (current-buffer)))))))
 
 (defconst ekipage--default-files
   '("*.el" "lisp/*.el"
@@ -50,26 +49,26 @@ of the destination build directory."
   (let ((default-directory src-dir)
         (stack (list (cons "" files)))
         exclude result)
-        (while stack
-          (pcase (car stack)
-            (`(,dir ,(and (pred stringp) srcpath) . ,_)
-             (let ((xs (file-expand-wildcards srcpath)))
-               (setq result
-                     (if exclude (cl-delete-if (lambda (x) (memq x xs)) result)
-                       (nconc (mapcar (lambda (x) (cons x dir)) xs) result))))
-             (pop (cdar stack)))
-            (`(,_) (setq exclude nil) (pop stack))
-            ;; Flatten nested SUBDIR/:exclude inside of :exclude
-            ((and (guard exclude) `(,_ (,_ . ,srcpaths) . ,rest))
-             (setf (cdar stack) (append srcpaths rest)))
-            (`(,dir (,(and (pred stringp) subdir) . ,srcpaths) . ,rest)
-             (setq stack `((,(concat dir subdir "/") . ,srcpaths)
-                           (,dir . ,rest) . ,(cdr stack))))
-            (`(,dir (:exclude . ,srcpaths) . ,rest)
-             (setq exclude t
-                   stack `((,dir . ,srcpaths) (,dir . ,rest) . ,(cdr stack))))
-            (_ (signal 'bad-files-directive files))))
-        result))
+    (while stack
+      (pcase (car stack)
+        (`(,dir ,(and (pred stringp) srcpath) . ,_)
+         (let ((xs (file-expand-wildcards srcpath)))
+           (setq result
+                 (if exclude (cl-delete-if (lambda (x) (memq x xs)) result)
+                   (nconc (mapcar (lambda (x) (cons x dir)) xs) result))))
+         (pop (cdar stack)))
+        (`(,_) (setq exclude nil) (pop stack))
+        ;; Flatten nested SUBDIR/:exclude inside of :exclude
+        ((and (guard exclude) `(,_ (,_ . ,srcpaths) . ,rest))
+         (setf (cdar stack) (append srcpaths rest)))
+        (`(,dir (,(and (pred stringp) subdir) . ,srcpaths) . ,rest)
+         (setq stack `((,(concat dir subdir "/") . ,srcpaths)
+                       (,dir . ,rest) . ,(cdr stack))))
+        (`(,dir (:exclude . ,srcpaths) . ,rest)
+         (setq exclude t
+               stack `((,dir . ,srcpaths) (,dir . ,rest) . ,(cdr stack))))
+        (_ (signal 'bad-files files))))
+    result))
 
 (defun ekipage--melpa-retrieve (package)
   "Look up the MELPA recipe for PACKAGE."
@@ -202,8 +201,8 @@ Returns whether any output files were produced."
               (make-hash-table))))
       ((file-missing end-of-file) (make-hash-table))))
   "Map of up-to-date packages to their build information.
-The values are (RECIPE DEPENDENCIES TIMESTAMP . AUTOLOADS) tuples, or
-just (RECIPE DEPENDENCIES) for clone-only packages.")
+The values are (RECIPE DEPENDENCIES TIMESTAMP . AUTOLOADS) tuples. For
+clone-only packages AUTOLOADS is nil.")
 
 (defun ekipage--modified-packages ()
   "Find packages in `ekipage--cache' with modified repositories using find(1)."
@@ -211,13 +210,12 @@ just (RECIPE DEPENDENCIES) for clone-only packages.")
          (tests
           (cl-loop
            for k being the hash-keys of ekipage--cache using (hash-values v) nconc
-           (pcase v
-             (`(,recipe ,_deps ,timestamp . ,_autoloads)
-              (let ((repo (plist-get recipe :local-repo)))
-                (puthash repo (cons k (gethash repo repos)) repos)
-                (list "-o" "-path" (concat repo "*")
-                      "-newermt" (format-time-string "%F %T" timestamp)
-                      "-printf" "%H\n" "-prune"))))))
+           (cl-destructuring-bind
+               ((&key local-repo &allow-other-keys) _deps timestamp &rest) v
+             (puthash local-repo (cons k (gethash local-repo repos)) repos)
+             (list "-o" "-path" (concat local-repo "*")
+                   "-newermt" (format-time-string "%F %T" timestamp)
+                   "-printf" "%H\n" "-prune"))))
          (args (nconc (cl-loop for k being the hash-keys of repos collect k)
                       (list "-name" ".git" "-prune") tests))
          (default-directory (file-name-concat ekipage-base-dir "repos"))
@@ -235,10 +233,9 @@ just (RECIPE DEPENDENCIES) for clone-only packages.")
             (cl-function
              (lambda (package (_recipe deps . rest))
                (unless (cl-loop
-                        for dep in deps always
-                        (let ((dep-pkg (if (consp dep) (car dep) dep)))
-                          (or (memq dep-pkg ekipage--ignored-dependencies)
-                              (gethash dep-pkg ekipage--cache))))
+                        for dep in deps for dep-pkg = (if (consp dep) (car dep) dep) always
+                        (or (memq dep-pkg ekipage--ignored-dependencies)
+                            (gethash dep-pkg ekipage--cache)))
                  (remhash package ekipage--cache) (setq changed t))))
             ekipage--cache)
            changed)))
@@ -301,9 +298,10 @@ just (RECIPE DEPENDENCIES) for clone-only packages.")
 (cl-defun ekipage-use-package
     (melpa-style-recipe
      &key no-build
-     &aux (name (if (listp melpa-style-recipe) (car melpa-style-recipe) melpa-style-recipe)))
+     &aux (name (if (consp melpa-style-recipe) (car melpa-style-recipe) melpa-style-recipe)))
   "Do thing.
 RECIPE is a MELPA style recipe."
+  (interactive "SPackage to use: ")
   (and (symbolp melpa-style-recipe) (memq name ekipage--ignored-dependencies)
        (cl-return-from ekipage-use-package))
   (pcase (gethash name ekipage--cache)
@@ -325,13 +323,13 @@ RECIPE is a MELPA style recipe."
                    (when (string= local-repo old-repo) (remhash k ekipage--cache))))
                 ekipage--cache)))
     ;; If already built: Just activate
-    ((and (or (and `(,recipe ,deps ,_timestamp . ,autoloads)
-                   (let build-dir (file-name-concat ekipage-base-dir "build"
-                                                    (plist-get recipe :package)))
-                   (guard (file-exists-p build-dir)))
-              `(,recipe ,deps)) ; clone-only package
+    ((and `(,recipe ,deps ,_timestamp . ,autoloads)
           (guard (file-exists-p (file-name-concat ekipage-base-dir "repos"
-                                                  (plist-get recipe :local-repo)))))
+                                                  (plist-get recipe :local-repo))))
+          (or (guard (not autoloads)) ; clone-only package
+              (and (let build-dir (file-name-concat ekipage-base-dir "build"
+                                                    (plist-get recipe :package)))
+                   (guard (file-exists-p build-dir)))))
      (pcase-dolist ((or `(,dep ,_) dep) deps) (ekipage-use-package dep))
      (when build-dir (ekipage--activate-package name build-dir autoloads))
      (cl-return-from ekipage-use-package)))
@@ -349,8 +347,7 @@ RECIPE is a MELPA style recipe."
          deps autoloads)
     (unless (file-exists-p repo-dir) (ekipage--clone-package recipe repo-dir))
 
-    (if no-build
-        (puthash name (list recipe nil) ekipage--cache)
+    (unless no-build
       (delete-directory build-dir t)
       (make-directory build-dir t)
       ;; Symlink files used to build the package
@@ -368,10 +365,9 @@ RECIPE is a MELPA style recipe."
       (setq autoloads (ekipage--build-package package build-dir))
       (ekipage--make-info build-dir)
 
-      (ekipage--activate-package name build-dir autoloads)
+      (ekipage--activate-package name build-dir autoloads))
 
-      (puthash name `(,recipe ,deps ,(time-add nil 1) . ,autoloads) ekipage--cache))
-
+    (puthash name `(,recipe ,deps ,(time-add nil 1) . ,autoloads) ekipage--cache)
     (if after-init-time (ekipage--write-cache)
       (add-hook 'after-init-hook #'ekipage--write-cache))))
 
