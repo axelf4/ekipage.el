@@ -72,12 +72,12 @@ of the destination build directory."
 
 (defun ekipage--melpa-retrieve (package)
   "Look up the MELPA recipe for PACKAGE."
-  (ekipage-use-package '(melpa :fetcher github :repo "melpa/melpa") :no-build t)
   (with-temp-buffer
     (condition-case nil
         (insert-file-contents-literally
-         (file-name-concat ekipage-base-dir "repos" "melpa" "recipes"
-                           (symbol-name package)))
+         (file-name-concat
+          (ekipage-use-package '(melpa :fetcher github :repo "melpa/melpa") :no-build t)
+          "recipes" (symbol-name package)))
       (file-missing nil)
       (:success
        (cl-destructuring-bind (name . recipe) (read (current-buffer))
@@ -88,19 +88,17 @@ of the destination build directory."
 
 (defun ekipage--gnu-elpa-retrieve (package)
   "Look up the GNU Elpa recipe for PACKAGE."
-  (ekipage-use-package
-   '(melpa :fetcher github :repo "emacs-straight/gnu-elpa-mirror") :no-build t)
   (when (file-exists-p
          (file-name-concat
-          ekipage-base-dir "repos" "gnu-elpa-mirror" (symbol-name package)))
+          (ekipage-use-package
+           '(gnu-elpa-mirror :fetcher github :repo "emacs-straight/gnu-elpa-mirror") :no-build t)
+          (symbol-name package)))
     (list package :fetcher 'github :repo (format "emacs-straight/%s" package)
           :files '("*" (:exclude ".git")))))
 
-;; TODO Use repos var to unify mono-repo repository in use
-;; (let ((_repos (make-hash-table :test 'equal))))
 (defun ekipage--normalize-recipe (melpa-style-recipe)
   (cl-destructuring-bind (package &rest recipe &key fetcher repo url &allow-other-keys)
-      (if (listp melpa-style-recipe)
+      (if (consp melpa-style-recipe)
           (copy-sequence melpa-style-recipe)
         (or (ekipage--melpa-retrieve melpa-style-recipe)
             (ekipage--gnu-elpa-retrieve melpa-style-recipe)
@@ -246,11 +244,11 @@ clone-only packages AUTOLOADS is nil.")
       (if (memq 'find-at-startup ekipage-check-for-modifications)
           (ekipage--modified-packages)
         ;; Invalidate any packages recorded in "modified" directory
-        (mapcar
+        (mapcan
          (lambda (modified-repo)
            (cl-loop
             for k being the hash-keys of ekipage--cache using (hash-values v)
-            if (string= (plist-get (car v) :local-repo) modified-repo) return k))
+            if (string= (plist-get (car v) :local-repo) modified-repo) collect k))
          (when (file-exists-p modified-dir)
            (directory-files
             modified-dir nil directory-files-no-dot-files-regexp t))))))
@@ -324,15 +322,16 @@ RECIPE is a MELPA style recipe."
                 ekipage--cache)))
     ;; If already built: Just activate
     ((and `(,recipe ,deps ,_timestamp . ,autoloads)
-          (guard (file-exists-p (file-name-concat ekipage-base-dir "repos"
-                                                  (plist-get recipe :local-repo))))
+          (let repo-dir (file-name-concat ekipage-base-dir "repos"
+                                          (plist-get recipe :local-repo)))
+          (guard (file-exists-p repo-dir))
           (or (guard (not autoloads)) ; clone-only package
               (and (let build-dir (file-name-concat ekipage-base-dir "build"
                                                     (plist-get recipe :package)))
                    (guard (file-exists-p build-dir)))))
      (pcase-dolist ((or `(,dep ,_) dep) deps) (ekipage-use-package dep))
      (when build-dir (ekipage--activate-package name build-dir autoloads))
-     (cl-return-from ekipage-use-package)))
+     (cl-return-from ekipage-use-package (or build-dir repo-dir))))
   ;; About to rebuild: Invalidate packages that may later use this package
   (when (gethash name ekipage--cache)
     (when (gethash name ekipage--activated-packages)
@@ -369,7 +368,8 @@ RECIPE is a MELPA style recipe."
 
     (puthash name `(,recipe ,deps ,(time-add nil 1) . ,autoloads) ekipage--cache)
     (if after-init-time (ekipage--write-cache)
-      (add-hook 'after-init-hook #'ekipage--write-cache))))
+      (add-hook 'after-init-hook #'ekipage--write-cache))
+    (if no-build repo-dir build-dir)))
 
 (provide 'ekipage)
 ;;; ekipage.el ends here
