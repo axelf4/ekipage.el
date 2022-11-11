@@ -23,8 +23,9 @@
        (and (ignore-error file-missing
               (insert-file-contents-literally (concat package ".el")))
             (re-search-forward
-             "[[:space:]]*;+[[:space:]]*Package-Requires:[[:space:]]*" nil t)
-            (read (current-buffer)))))))
+             "^;+[[:space:]]*Package-Requires[[:space:]]*:[[:space:]]*\\(.*\\(?:\n;+\\(?:\t\\|[ \t]\\{2,\\}\\).+\\)*\\)" nil t)
+            (read (replace-regexp-in-string
+                   "\n;+[ \t]+" " " (match-string-no-properties 1) t t)))))))
 
 (defconst ekipage--default-files
   '("*.el" "lisp/*.el"
@@ -83,7 +84,7 @@ of the destination build directory."
        (cl-destructuring-bind (name . recipe) (read (current-buffer))
          (when-let ((tail (cdr (plist-member recipe :files))))
            ;; Ensure *-pkg.el is included (may be implicit as MELPA always creates it)
-           (setcar tail (append (car tail) (list (format "%s-pkg.el" name)))))
+           (setcar tail (nconc (car tail) (list (format "%s-pkg.el" name)))))
          (cons name recipe))))))
 
 (defun ekipage--gnu-elpa-retrieve (package)
@@ -297,8 +298,8 @@ clone-only packages AUTOLOADS is nil.")
     (melpa-style-recipe
      &key no-build
      &aux (name (if (consp melpa-style-recipe) (car melpa-style-recipe) melpa-style-recipe)))
-  "Do thing.
-RECIPE is a MELPA style recipe."
+  "Make the package specified by MELPA-STYLE-RECIPE available in this session.
+Returns the directory containing the built package."
   (interactive "SPackage to use: ")
   (and (symbolp melpa-style-recipe) (memq name ekipage--ignored-dependencies)
        (cl-return-from ekipage-use-package))
