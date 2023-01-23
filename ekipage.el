@@ -3,6 +3,7 @@
 (eval-when-compile
   (require 'cl-lib)
   (require 'subr-x))
+(declare-function cl-delete-if "cl-seq")
 
 (defgroup ekipage nil "An Emacs Lisp package manager." :group 'applications)
 
@@ -36,7 +37,7 @@
      ".dir-locals.el" "lisp/.dir-locals.el"
      "test.el" "tests.el" "*-test.el" "*-tests.el"
      "lisp/test.el" "lisp/tests.el" "lisp/*-test.el" "lisp/*-tests.el"))
-  "Default value for the `:files' directive in recipes.")
+  "Default value for the `:files' recipe directive.")
 
 (defun ekipage--expand-files (files src-dir)
   "Determine the files used to build the package from its `:files' directive.
@@ -55,7 +56,7 @@ of the destination build directory."
         (`(,dir ,(and (pred stringp) srcpath) . ,_)
          (let ((xs (file-expand-wildcards srcpath)))
            (setq result
-                 (if exclude (cl-delete-if (lambda (x) (memq x xs)) result)
+                 (if exclude (cl-delete-if (lambda (x) (member x xs)) result :key #'car)
                    (nconc (mapcar (lambda (x) (cons x dir)) xs) result))))
          (pop (cdar stack)))
         (`(,_) (setq exclude nil) (pop stack))
@@ -68,7 +69,7 @@ of the destination build directory."
         (`(,dir (:exclude . ,srcpaths) . ,rest)
          (setq exclude t
                stack `((,dir . ,srcpaths) (,dir . ,rest) . ,(cdr stack))))
-        (_ (signal 'bad-files files))))
+        (_ (error "Invalid :files directive `%S'" files))))
     result))
 
 (defun ekipage--melpa-retrieve (package)
@@ -103,7 +104,7 @@ of the destination build directory."
           (copy-sequence melpa-style-recipe)
         (or (ekipage--melpa-retrieve melpa-style-recipe)
             (ekipage--gnu-elpa-retrieve melpa-style-recipe)
-            (error "Recipe for package %s not found" melpa-style-recipe)))
+            (error "Recipe for package `%s' not found" melpa-style-recipe)))
     (setq recipe (plist-put recipe :package (symbol-name package)))
     (let ((repo (pcase fetcher
                   ((or 'nil 'github 'gitlab)
@@ -118,15 +119,18 @@ of the destination build directory."
   :type '(choice (string :tag "Buffer name")
                  (const :tag "Discard output" nil)))
 
+(cl-defun ekipage--recipe-git-url ((&key package fetcher repo url &allow-other-keys))
+  (pcase fetcher
+    ('git url)
+    ('github (format "https://github.com/%s.git" repo))
+    ('gitlab (format "https://gitlab.com/%s.git" repo))
+    (_ (error "Unknown fetcher %S for package %s" fetcher package))))
+
 (cl-defun ekipage--clone-package
-    ((&key package local-repo fetcher repo url branch &allow-other-keys) repo-dir)
+    ((&whole recipe &key package local-repo branch &allow-other-keys) repo-dir)
   (message "Cloning %s into %s..." package local-repo)
   (make-directory repo-dir t)
-  (let ((url (pcase fetcher
-               ('git url)
-               ('github (format "https://github.com/%s.git" repo))
-               ('gitlab (format "https://gitlab.com/%s.git" repo))
-               (_ (error "Unknown fetcher %S for package %s" fetcher package)))))
+  (let ((url (ekipage--recipe-git-url recipe)))
     (apply #'call-process "git" nil ekipage-byte-compilation-buffer nil
            ;; Use "origin" regardless of clone.defaultRemoteName from user config
            "clone" "--origin" "origin" "--depth" "1" "--no-single-branch"
@@ -171,7 +175,7 @@ Returns whether any output files were produced."
       (condition-case err
           (cl-destructuring-bind (info-file . indices) (texinfo-format-buffer-1)
             (Info-tagify)
-            (Info-split)
+            (ignore-error error (Info-split))
             (call-process "install-info" nil ekipage-byte-compilation-buffer nil
                           info-file (file-name-concat build-dir "dir")))
         (:success (setq has-info t))
@@ -182,9 +186,16 @@ Returns whether any output files were produced."
 (defconst ekipage--ignored-dependencies '(emacs cl-lib cl-generic nadvice seq)
   "Packages to ignore.")
 
-(defcustom ekipage-check-for-modifications '(check-on-save)
+(defcustom ekipage-check-for-modifications '(find-at-startup)
   "How to check for modifications."
-  :type '(set (const :tag "Get modifications with find(1)" find-at-startup)))
+  :type '(set (const :tag "Use find(1) at startup" find-at-startup)
+              (const :tag "Fee" check-on-save))
+  :initialize #'custom-initialize-changed
+  :set (lambda (symbol value)
+         (set-default symbol value)
+         (if (memq 'check-on-save value)
+             (add-hook 'before-save-hook #'ekipage--register-modification)
+           (remove-hook 'before-save-hook #'ekipage--register-modification))))
 
 (defvar ekipage--cache
   (let ((cache-file (file-name-concat ekipage-base-dir "cache")))
@@ -200,8 +211,8 @@ Returns whether any output files were produced."
               (make-hash-table))))
       ((file-missing end-of-file) (make-hash-table))))
   "Map of up-to-date packages to their build information.
-The values are (RECIPE DEPENDENCIES TIMESTAMP . AUTOLOADS) tuples. For
-clone-only packages AUTOLOADS is nil.")
+The values are (RECIPE ORIGINAL DEPENDENCIES TIMESTAMP . AUTOLOADS)
+tuples. For clone-only packages AUTOLOADS is nil.")
 
 (defun ekipage--modified-packages ()
   "Find packages in `ekipage--cache' with modified repositories using find(1)."
@@ -210,12 +221,12 @@ clone-only packages AUTOLOADS is nil.")
           (cl-loop
            for k being the hash-keys of ekipage--cache using (hash-values v) nconc
            (cl-destructuring-bind
-               ((&key local-repo &allow-other-keys) _deps timestamp &rest) v
+               ((&key local-repo &allow-other-keys) _original _deps timestamp &rest) v
              (puthash local-repo (cons k (gethash local-repo repos)) repos)
              (list "-o" "-path" (concat local-repo "*")
                    "-newermt" (format-time-string "%F %T" timestamp)
                    "-printf" "%H\n" "-prune"))))
-         (args (nconc (cl-loop for k being the hash-keys of repos collect k)
+         (args (nconc (hash-table-keys repos)
                       (list "-name" ".git" "-prune") tests))
          (default-directory (file-name-concat ekipage-base-dir "repos"))
          result)
@@ -230,7 +241,7 @@ clone-only packages AUTOLOADS is nil.")
   (while (let (changed) ; Fixpoint calculation
            (maphash
             (cl-function
-             (lambda (package (_recipe deps . rest))
+             (lambda (package (_recipe _original deps . rest))
                (unless (cl-loop
                         for dep in deps for dep-pkg = (if (consp dep) (car dep) dep) always
                         (or (memq dep-pkg ekipage--ignored-dependencies)
@@ -263,13 +274,6 @@ clone-only packages AUTOLOADS is nil.")
       (print emacs-version (current-buffer))
       (print ekipage--cache (current-buffer))))
   (delete-directory (file-name-concat ekipage-base-dir "modified") t))
-
-(define-minor-mode ekipage-check-modifications-mode
-  "Mode that records modifications to package repositories managed by ekipage.el."
-  :global t
-  (if ekipage-check-modifications-mode
-      (add-hook 'before-save-hook #'ekipage--register-modification)
-    (remove-hook 'before-save-hook #'ekipage--register-modification)))
 
 (defun ekipage--register-modification ()
   "If the current buffer visits a file in a managed repository, mark it modified."
@@ -305,15 +309,8 @@ Returns the directory containing the built package."
        (cl-return-from ekipage-use-package))
   (pcase (gethash name ekipage--cache)
     ;; If manually specified recipe differs from cache: Rebuild if possible
-    ((and (let `(,_name . ,manual-recipe) melpa-style-recipe) `(,recipe . ,_)
-          ;; Since recipes proplists are never shuffled, discrepancies
-          ;; may be found by iterating both proplists in lockstep.
-          (guard (cl-loop
-                  with as = manual-recipe for bs on recipe by #'cddr finally return as
-                  if (eq (car as) (car bs))
-                  unless (equal (cadr as) (cadr bs)) return t end
-                  and do (setq as (cddr as))
-                  else unless (memq (car bs) '(:package :local-repo)) return t)))
+    ((and (let `(,_name . ,manual-recipe) melpa-style-recipe) `(,recipe ,original . ,_)
+          (guard (not (equal manual-recipe original))))
      ;; Invalidate other packages built from repository in old recipe
      ;; regardless of whether repository details changed.
      (let ((old-repo (plist-get recipe :local-repo)))
@@ -322,7 +319,7 @@ Returns the directory containing the built package."
                    (when (string= local-repo old-repo) (remhash k ekipage--cache))))
                 ekipage--cache)))
     ;; If already built: Just activate
-    ((and `(,recipe ,deps ,_timestamp . ,autoloads)
+    ((and `(,recipe ,_original ,deps ,_timestamp . ,autoloads)
           (let repo-dir (file-name-concat ekipage-base-dir "repos"
                                           (plist-get recipe :local-repo)))
           (guard (file-exists-p repo-dir))
@@ -336,7 +333,7 @@ Returns the directory containing the built package."
   ;; About to rebuild: Invalidate packages that may later use this package
   (when (gethash name ekipage--cache)
     (when (gethash name ekipage--activated-packages)
-      (error "Tried to rebuild package %s which is already loaded. Impossible as it is to unload a package you will have to restart Emacs before proceeding." name))
+      (error "Rebuild of already loaded package `%s' required. Impossible as it is to unload a package you will have to restart Emacs before proceeding." name))
     (remhash name ekipage--cache) (ekipage--invalidate-dependents))
 
   (let* ((recipe (ekipage--normalize-recipe melpa-style-recipe))
@@ -367,7 +364,9 @@ Returns the directory containing the built package."
 
       (ekipage--activate-package name build-dir autoloads))
 
-    (puthash name `(,recipe ,deps ,(time-add nil 1) . ,autoloads) ekipage--cache)
+    (puthash
+     name `(,recipe ,melpa-style-recipe ,deps ,(time-add nil 1) . ,autoloads)
+     ekipage--cache)
     (if after-init-time (ekipage--write-cache)
       (add-hook 'after-init-hook #'ekipage--write-cache))
     (if no-build repo-dir build-dir)))
