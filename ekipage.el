@@ -1,8 +1,22 @@
 ;;; ekipage.el --- Emacs Lisp package manager  -*- lexical-binding: t -*-
 
+;; Copyright 2022 Axel Forsman
+
+;; Author: Axel Forsman <axel@axelf.nu>
+;; Version: 0.1
+;; Package-Requires: ((emacs "28.1"))
+;; Keywords: extensions
+;; Homepage: https://github.com/axelf4/ekipage.el
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
+;;; Commentary:
+
+;;; Code:
+
 (eval-when-compile
   (require 'cl-lib)
   (require 'subr-x))
+(require 'generator)
 (declare-function cl-delete-if "cl-seq")
 
 (defgroup ekipage nil "An Emacs Lisp package manager." :group 'applications)
@@ -225,7 +239,7 @@ tuples. For clone-only packages AUTOLOADS is nil.")
 
 (defun ekipage--modified-packages ()
   "Find packages in `ekipage--cache' with modified repositories using find(1)."
-  (let* ((repos (make-hash-table :test 'equal))
+  (let* ((repos (make-hash-table :test #'equal))
          (tests
           (cl-loop
            for k being the hash-keys of ekipage--cache using (hash-values v) nconc
@@ -289,13 +303,19 @@ tuples. For clone-only packages AUTOLOADS is nil.")
   (when-let* (buffer-file-name
               (repos-dir (file-name-as-directory
                           (file-name-concat ekipage-base-dir "repos")))
-              ((string-prefix-p repos-dir buffer-file-name
-                                (file-name-case-insensitive-p repos-dir)))
-              (slash-pos (string-match-p "/" buffer-file-name (length repos-dir)))
-              (repo (substring buffer-file-name (length repos-dir) slash-pos)))
+              (build-dir (file-name-as-directory
+                          (file-name-concat ekipage-base-dir "build")))
+              (dir (or (when (string-prefix-p repos-dir buffer-file-name
+                                              (file-name-case-insensitive-p repos-dir))
+                         repos-dir)
+                       (when (string-prefix-p build-dir buffer-file-name
+                                              (file-name-case-insensitive-p build-dir))
+                         build-dir)))
+              (/-pos (string-match-p "/" buffer-file-name (length dir)))
+              (repo (substring buffer-file-name (length dir) /-pos)))
     (make-empty-file (file-name-concat ekipage-base-dir "modified" repo) t)))
 
-(defvar ekipage--activated-packages (make-hash-table :test 'eq)
+(defvar ekipage--activated-packages (make-hash-table :test #'eq)
   "The set of packages that are loaded in this Emacs session.")
 
 (defun ekipage--activate-package (name build-dir autoloads)
@@ -380,6 +400,89 @@ Impossible as it is to unload a package you will have to restart Emacs before pr
     (if after-init-time (ekipage--write-cache)
       (add-hook 'after-init-hook #'ekipage--write-cache))
     (if no-build repo-dir build-dir)))
+
+(defun ekipage--repos ()
+  (cl-loop
+   with default-directory = (file-name-concat ekipage-base-dir "repos")
+   for package being the hash-keys of ekipage--activated-packages
+   for (recipe) = (gethash package ekipage--cache)
+   for repo = (plist-get recipe :local-repo) when (and repo (file-exists-p repo))
+   collect
+   (let ((_actual-url
+         (with-output-to-string
+              (with-current-buffer standard-output
+                (call-process "git" nil t nil "-C" repo "config" "--get" "remote.origin.url")))))
+     ;; TODO Include :fetcher related properties of recipe
+     repo)
+   into result finally return (delete-dups result)))
+
+;; TODO Ensure remote exists and has correct URL (straight-vc-git--ensure-remote)
+;; TODO Merge/rebase in progress?
+;; TODO Implement checking out specific branch/commit/tag
+;; TODO Ensure it is checked out correctly (straight-vc-git--ensure-head-at-branch)
+
+(cl-defun ekipage-fetch-all
+    (&aux (default-directory (file-name-concat ekipage-base-dir "repos")))
+  (let* ((processes
+          (iter-make
+           (cl-loop
+            for repo in (ekipage--repos)
+            unless (call-process "git" nil nil nil "-C" repo "diff-index" "--quiet" "HEAD") do
+            (message "Repository `%s' is dirty, skipping..." repo)
+            else do
+            (message "Fetching %s..." repo)
+            (let ((process (make-process
+                            :name (concat "ekipage-fetch-" repo)
+                            :command `("git" "-C" ,repo "fetch" "--all")
+                            :noquery t)))
+              (process-put process :repo repo)
+              (iter-yield process)))))
+         (running (cl-loop repeat (num-processors)
+                           for process iter-by processes collect process)))
+    (while running
+      (unless (cl-loop
+               with changed finally return changed
+               for xs on running and prev = nil then xs for process = (car xs)
+               unless (process-live-p process) do
+               (setq changed t)
+               (let ((exit-status (process-exit-status process)))
+                 (if (zerop exit-status)
+                     (message "Finished: `%s'" (process-get process :repo))
+                   (message "Process `%s' failed with exit status `%s'"
+                            process exit-status)))
+               (condition-case _
+                   (setcar xs (iter-next processes))
+                 (iter-end-of-sequence
+                  (if prev (setf (cdr prev) (cdr xs)) (pop running)))))
+        (accept-process-output nil 5)))))
+
+(defun ekipage-pull-all ()
+  (interactive)
+  (cl-loop
+   with default-directory = (file-name-concat ekipage-base-dir "repos")
+   for repo in (ekipage--repos)
+   for modified = (not (call-process "git" nil nil nil "-C" repo "diff-index" "--quiet" "HEAD"))
+   if modified do
+   (message "Repository %s is dirty, skipping..." repo)
+   else do
+   (message "Fetching %s..." repo)
+   (call-process "git" nil ekipage-byte-compilation-buffer nil
+                 "-C" repo "fetch" "--all")
+   (unless (string=
+            (with-output-to-string
+              (with-current-buffer standard-output
+                (call-process "git" nil t nil "-C" repo "rev-parse" "master")))
+            (with-output-to-string
+              (with-current-buffer standard-output
+                (call-process "git" nil t nil "-C" repo "rev-parse" "origin/master"))))
+     (message "Merging into %s from origin..." repo)
+     (if (call-process "git" nil ekipage-byte-compilation-buffer nil
+                       "-C" repo "merge-base" "--is-ancestor" "HEAD" "origin/HEAD")
+         (progn
+           (make-empty-file (file-name-concat ekipage-base-dir "modified" repo) t)
+           (call-process "git" nil ekipage-byte-compilation-buffer nil
+                         "-C" repo "merge" "--ff-only"))
+       (message "Cannot fast-forward repository %s!" repo)))))
 
 (provide 'ekipage)
 ;;; ekipage.el ends here
