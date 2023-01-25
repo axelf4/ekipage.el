@@ -138,14 +138,15 @@ of the destination build directory."
     (_ (error "Unknown fetcher %S for package %s" fetcher package))))
 
 (cl-defun ekipage--clone-package
-    ((&whole recipe &key package local-repo branch &allow-other-keys) repo-dir)
+    ((&whole recipe &key package local-repo branch (depth 1) &allow-other-keys) repo-dir)
   (message "Cloning %s into %s..." package local-repo)
   (make-directory repo-dir t)
   (let ((url (ekipage--recipe-git-url recipe)))
     (apply #'call-process "git" nil ekipage-byte-compilation-buffer nil
            ;; Use "origin" regardless of clone.defaultRemoteName from user config
-           "clone" "--origin" "origin" "--depth" "1" "--no-single-branch"
-           `(,@(when branch (list "--branch" branch))
+           "clone" "--origin" "origin"
+           `(,@(when depth (list "--depth" (number-to-string depth)))
+             ,@(when branch (list "--branch" branch))
              "--" ,url ,repo-dir))))
 
 (defun ekipage--build-package (package build-dir)
