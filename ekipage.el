@@ -31,12 +31,12 @@
   (with-temp-buffer
     (condition-case nil
         ;; Either from <PACKAGE>-pkg.el metadata
-        (insert-file-contents-literally (concat package "-pkg.el"))
+        (insert-file-contents-literally (format "%s-pkg.el" package))
       (:success (eval (nth 4 (read (current-buffer)))))
       (file-missing
        ;; Or the <PACKAGE>.el preamble
        (and (ignore-error file-missing
-              (insert-file-contents-literally (concat package ".el")))
+              (insert-file-contents-literally (format "%s.el" package)))
             (re-search-forward
              "^;+[[:space:]]*Package-Requires[[:space:]]*:[[:space:]]*\\(.*\\(?:\n;+\\(?:\t\\|[ \t]\\{2,\\}\\).+\\)*\\)" nil t)
             (read (replace-regexp-in-string
@@ -91,7 +91,7 @@ of the destination build directory."
   (defvar package--builtins)
   (require 'finder-inf)
   (when (assq package package--builtins)
-    (list package :fetcher 'built-in)))
+    (list :fetcher 'built-in)))
 
 (defun ekipage--melpa-retrieve (package)
   "Look up the MELPA recipe for PACKAGE."
@@ -101,13 +101,13 @@ of the destination build directory."
          (file-name-concat
           (ekipage-use-package '(melpa :fetcher github :repo "melpa/melpa") :no-build t)
           "recipes" (symbol-name package)))
-      (file-missing nil)
+      (file-missing)
       (:success
-       (cl-destructuring-bind (name . recipe) (read (current-buffer))
+       (cl-destructuring-bind (_name . recipe) (read (current-buffer))
          (when-let ((tail (cdr (plist-member recipe :files))))
            ;; Ensure *-pkg.el is included (may be implicit as MELPA always creates it)
-           (setcar tail (nconc (car tail) (list (format "%s-pkg.el" name)))))
-         (cons name recipe))))))
+           (setcar tail (nconc (car tail) (list (format "%s-pkg.el" package)))))
+         recipe)))))
 
 (defun ekipage--gnu-elpa-retrieve (package)
   "Look up the GNU Elpa recipe for PACKAGE."
@@ -116,26 +116,24 @@ of the destination build directory."
           (ekipage-use-package
            '(gnu-elpa-mirror :fetcher github :repo "emacs-straight/gnu-elpa-mirror") :no-build t)
           (symbol-name package)))
-    (list package :fetcher 'github :repo (format "emacs-straight/%s" package)
+    (list :fetcher 'github :repo (format "emacs-straight/%s" package)
           :files '("*" (:exclude ".git")))))
 
 (defun ekipage--normalize-recipe (melpa-style-recipe)
-  (cl-destructuring-bind (package &rest recipe &key fetcher local-repo repo url &allow-other-keys)
+  (cl-destructuring-bind (&rest recipe &key fetcher local-repo repo url &allow-other-keys)
       (if (consp melpa-style-recipe)
-          (copy-sequence melpa-style-recipe)
+          (copy-sequence (cdr melpa-style-recipe))
         (or (ekipage--built-in-retrive melpa-style-recipe)
             (ekipage--melpa-retrieve melpa-style-recipe)
             (ekipage--gnu-elpa-retrieve melpa-style-recipe)
             (error "Recipe for package `%s' not found" melpa-style-recipe)))
-    (setq recipe (plist-put recipe :package (symbol-name package)))
     (when-let
         (((null local-repo))
          (repo (pcase fetcher
                  ((or 'nil 'github 'gitlab)
                   (substring repo (1+ (string-match-p "/" repo))))
                  ('git (string-remove-suffix ".git" (file-name-nondirectory url)))
-                 ('built-in)
-                 (_ (symbol-name package)))))
+                 ('built-in))))
       (setq recipe (plist-put recipe :local-repo repo)))
     recipe))
 
@@ -144,15 +142,15 @@ of the destination build directory."
   :type '(choice (string :tag "Buffer name")
                  (const :tag "Discard output" nil)))
 
-(cl-defun ekipage--recipe-git-url ((&key package fetcher repo url &allow-other-keys))
+(cl-defun ekipage--recipe-git-url ((&whole recipe &key fetcher repo url &allow-other-keys))
   (pcase fetcher
     ('git url)
     ('github (format "https://github.com/%s.git" repo))
     ('gitlab (format "https://gitlab.com/%s.git" repo))
-    (_ (error "Unknown fetcher %S for package %s" fetcher package))))
+    (_ (error "Unknown fetcher in recipe: %S" recipe))))
 
 (cl-defun ekipage--clone-package
-    ((&whole recipe &key package local-repo branch (depth 1) &allow-other-keys) repo-dir)
+    (package (&whole recipe &key local-repo branch (depth 1) &allow-other-keys) repo-dir)
   (message "Cloning %s into %s..." package local-repo)
   (make-directory repo-dir t)
   (let ((url (ekipage--recipe-git-url recipe)))
@@ -172,7 +170,7 @@ Returns the generated autoloads loadable via `eval'."
   (normal-top-level-add-subdirs-to-load-path)
   (byte-recompile-directory %S 0 t t))"
                        (file-name-directory build-dir) build-dir))
-         (autoloads-file (concat package "-autoloads.el")))
+         (autoloads-file (format "%s-autoloads.el" package)))
     ;; Byte-compile in subprocess to have a clean environment
     (call-process emacs nil ekipage-byte-compilation-buffer nil
                   "-Q" "--batch" "--eval" expr)
@@ -261,14 +259,14 @@ tuples. For clone-only packages AUTOLOADS is nil.")
     result))
 
 (defun ekipage--invalidate-dependents ()
-  "Invalidate packages in CACHE that transitively depend on stale packages."
+  "Invalidate packages that transitively depend on stale packages."
   (while (let (changed) ; Fixpoint calculation
            (maphash
             (cl-function
              (lambda (package (_recipe _original deps . rest))
                (unless (cl-loop
-                        for dep in deps for dep-pkg = (if (consp dep) (car dep) dep)
-                        always (gethash dep-pkg ekipage--cache))
+                        for dep in deps always
+                        (gethash (if (consp dep) (car dep) dep) ekipage--cache))
                  (remhash package ekipage--cache) (setq changed t))))
             ekipage--cache)
            changed)))
@@ -318,10 +316,10 @@ tuples. For clone-only packages AUTOLOADS is nil.")
 (defvar ekipage--activated-packages (make-hash-table :test #'eq)
   "The set of packages that are loaded in this Emacs session.")
 
-(defun ekipage--activate-package (name build-dir autoloads)
-  "Activate the package built by RECIPE."
-  (unless (gethash name ekipage--activated-packages)
-    (puthash name t ekipage--activated-packages)
+(defun ekipage--activate-package (package build-dir autoloads)
+  "Activate PACKAGE."
+  (unless (gethash package ekipage--activated-packages)
+    (puthash package t ekipage--activated-packages)
     (push build-dir load-path)
     ;; TODO Add build-dir to Info-directory-list once it is initialized
     (eval autoloads))) ; Cache autoloads to avoid loading file
@@ -352,8 +350,7 @@ Returns the directory containing the built package."
                 (file-name-concat ekipage-base-dir "repos" repo)))
           (or (guard (null autoloads)) ; clone-only package
               (let (and build-dir (pred #'file-exists-p))
-                (file-name-concat ekipage-base-dir "build"
-                                  (plist-get recipe :package)))))
+                (file-name-concat ekipage-base-dir "build" (symbol-name name)))))
      (pcase-dolist ((or `(,dep ,_) dep) deps) (ekipage-use-package dep))
      (when build-dir (ekipage--activate-package name build-dir autoloads))
      (cl-return-from ekipage-use-package (or build-dir repo-dir))))
@@ -365,13 +362,12 @@ Impossible as it is to unload a package you will have to restart Emacs before pr
     (remhash name ekipage--cache) (ekipage--invalidate-dependents))
 
   (let* ((recipe (ekipage--normalize-recipe melpa-style-recipe))
-         (package (plist-get recipe :package))
          (repo (plist-get recipe :local-repo))
          (repo-dir (when repo (file-name-concat ekipage-base-dir "repos" repo)))
-         (build-dir (file-name-concat ekipage-base-dir "build" package))
+         (build-dir (file-name-concat ekipage-base-dir "build" (symbol-name name)))
          deps autoloads)
     (if repo
-        (unless (file-exists-p repo-dir) (ekipage--clone-package recipe repo-dir))
+        (unless (file-exists-p repo-dir) (ekipage--clone-package name recipe repo-dir))
       (setq no-build t))
 
     (unless no-build
@@ -385,11 +381,11 @@ Impossible as it is to unload a package you will have to restart Emacs before pr
         (file-name-concat repo-dir srcfile)
         (if (string-empty-p dst-dir) "./" (make-directory dst-dir t) dst-dir) t))
       ;; Ensure dependencies are built
-      (setq deps (ekipage--dependencies package build-dir))
+      (setq deps (ekipage--dependencies name build-dir))
       (pcase-dolist ((or `(,dep ,_) dep) deps) (ekipage-use-package dep))
       ;; Build the package
-      (message "Compiling %s..." package)
-      (setq autoloads (ekipage--build-package package build-dir))
+      (message "Compiling %s..." name)
+      (setq autoloads (ekipage--build-package name build-dir))
       (ekipage--make-info build-dir)
 
       (ekipage--activate-package name build-dir autoloads))
