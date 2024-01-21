@@ -15,8 +15,8 @@
 
 (eval-when-compile
   (require 'cl-lib)
-  (require 'subr-x))
-(require 'generator)
+  (require 'subr-x)
+  (require 'generator))
 (declare-function cl-delete-if "cl-seq")
 
 (defgroup ekipage nil "An Emacs Lisp package manager." :group 'applications)
@@ -90,8 +90,8 @@ of the destination build directory."
   "Return a dummy recipe for built-in PACKAGE, otherwise nil."
   (defvar package--builtins)
   (require 'finder-inf)
-  (when (assq package package--builtins)
-    (list :fetcher 'built-in)))
+  (and (assq package package--builtins) (not (eq package 'transient))
+       (list :fetcher 'built-in)))
 
 (defun ekipage--melpa-retrieve (package)
   "Look up the MELPA recipe for PACKAGE."
@@ -137,8 +137,8 @@ of the destination build directory."
       (setq recipe (plist-put recipe :local-repo repo)))
     recipe))
 
-(defcustom ekipage-byte-compilation-buffer "*ekipage-byte-compilation*"
-  "Name of the byte-compilation log buffer, or nil to discard output."
+(defcustom ekipage-process-buffer "*ekipage-process-log*"
+  "Name of the process output buffer, or nil to discard output."
   :type '(choice (string :tag "Buffer name")
                  (const :tag "Discard output" nil)))
 
@@ -154,7 +154,7 @@ of the destination build directory."
   (message "Cloning %s into %s..." package local-repo)
   (make-directory repo-dir t)
   (let ((url (ekipage--recipe-git-url recipe)))
-    (apply #'call-process "git" nil ekipage-byte-compilation-buffer nil
+    (apply #'call-process "git" nil ekipage-process-buffer nil
            ;; Use "origin" regardless of clone.defaultRemoteName from user config
            "clone" "--origin" "origin"
            `(,@(when depth (list "--depth" (number-to-string depth)))
@@ -163,7 +163,7 @@ of the destination build directory."
 
 (defun ekipage--build-package (package build-dir)
   "Byte-compile PACKAGE inside of BUILD-DIR.
-Returns the generated autoloads loadable via `eval'."
+Return the generated autoloads loadable via `eval'."
   (let* ((default-directory build-dir)
          (emacs (concat invocation-directory invocation-name))
          (expr (format "(let ((default-directory %S))
@@ -172,10 +172,12 @@ Returns the generated autoloads loadable via `eval'."
                        (file-name-directory build-dir) build-dir))
          (autoloads-file (format "%s-autoloads.el" package)))
     ;; Byte-compile in subprocess to have a clean environment
-    (call-process emacs nil ekipage-byte-compilation-buffer nil
+    (call-process emacs nil ekipage-process-buffer nil
                   "-Q" "--batch" "--eval" expr)
     ;; Generate autoloads
-    (make-directory-autoloads build-dir autoloads-file)
+    (if (eval-when-compile (>= emacs-major-version 29))
+        (loaddefs-generate build-dir autoloads-file)
+      (make-directory-autoloads build-dir autoloads-file))
     ;; Read generated autoloads
     ;; TODO Find output files overridden with generated-autoload-file
     (with-temp-buffer
@@ -200,7 +202,7 @@ Returns whether any output files were produced."
           (cl-destructuring-bind (info-file . indices) (texinfo-format-buffer-1)
             (Info-tagify)
             (ignore-error error (Info-split))
-            (call-process "install-info" nil ekipage-byte-compilation-buffer nil
+            (call-process "install-info" nil ekipage-process-buffer nil
                           info-file (file-name-concat build-dir "dir")))
         (:success (setq has-info t))
         ((error file-missing)
@@ -270,6 +272,11 @@ tuples. For clone-only packages AUTOLOADS is nil.")
                  (remhash package ekipage--cache) (setq changed t))))
             ekipage--cache)
            changed)))
+
+;; (defun ekipage--invalidate-repo (repo)
+;;   (cl-loop
+;;    for k being the hash-keys of ekipage--cache using (hash-values v)
+;;    if (string= (plist-get (car v) :local-repo) repo) do (remhash k ekipage--cache)))
 
 (when-let* ; Invalidate stale packages in cache
     ((modified-dir (file-name-concat ekipage-base-dir "modified"))
@@ -346,10 +353,10 @@ Returns the directory containing the built package."
     ((and `(,recipe ,_original ,deps ,_timestamp . ,autoloads)
           (let repo (plist-get recipe :local-repo))
           (or (guard (null repo))
-              (let (and repo-dir (pred #'file-exists-p))
+              (let (and repo-dir (pred file-exists-p))
                 (file-name-concat ekipage-base-dir "repos" repo)))
           (or (guard (null autoloads)) ; clone-only package
-              (let (and build-dir (pred #'file-exists-p))
+              (let (and build-dir (pred file-exists-p))
                 (file-name-concat ekipage-base-dir "build" (symbol-name name)))))
      (pcase-dolist ((or `(,dep ,_) dep) deps) (ekipage-use-package dep))
      (when build-dir (ekipage--activate-package name build-dir autoloads))
@@ -397,88 +404,92 @@ Impossible as it is to unload a package you will have to restart Emacs before pr
       (add-hook 'after-init-hook #'ekipage--write-cache))
     (if no-build repo-dir build-dir)))
 
-(defun ekipage--repos ()
+(defun ekipage--repos (recipes)
   (cl-loop
-   with default-directory = (file-name-concat ekipage-base-dir "repos")
-   for package being the hash-keys of ekipage--activated-packages
-   for (recipe) = (gethash package ekipage--cache)
-   for repo = (plist-get recipe :local-repo) when (and repo (file-exists-p repo))
-   collect
-   (let ((_actual-url
-         (with-output-to-string
-              (with-current-buffer standard-output
-                (call-process "git" nil t nil "-C" repo "config" "--get" "remote.origin.url")))))
-     ;; TODO Include :fetcher related properties of recipe
-     repo)
-   into result finally return (delete-dups result)))
+   for recipe in recipes
+   for repo = (plist-get recipe :local-repo) when repo
+   ;; TODO Include :fetcher related properties of recipe
+   collect repo into result finally return (delete-dups result)))
 
+;; TODO Pull recipe repos first and see if any recipes changed
 ;; TODO Ensure remote exists and has correct URL (straight-vc-git--ensure-remote)
 ;; TODO Merge/rebase in progress?
 ;; TODO Implement checking out specific branch/commit/tag
 ;; TODO Ensure it is checked out correctly (straight-vc-git--ensure-head-at-branch)
 
-(cl-defun ekipage-fetch-all
-    (&aux (default-directory (file-name-concat ekipage-base-dir "repos")))
-  (let* ((processes
+;; When do we
+
+(defun ekipage--git-ensure-remote (expected-url repo)
+  (let ((actual-url
+         (with-output-to-string
+           (with-current-buffer standard-output
+             (call-process "git" nil t nil "-C" repo "config" "--get" "remote.origin.url")))))
+    ;; TODO Allow the protocols to differ
+    (unless (string= actual-url expected-url) t)))
+
+(cl-defun ekipage-update
+    (packages &aux (default-directory (file-name-concat ekipage-base-dir "repos")))
+  (interactive
+   (list (or (mapcar #'intern-soft
+                     (completing-read-multiple
+                      "Packages to update: " ekipage--cache nil t))
+             (hash-table-keys ekipage--cache))))
+  (require 'generator)
+  (declare-function iter-next "generator")
+  (let* ((recipes (mapcar (lambda (package) (car (gethash package ekipage--cache)))
+                          packages))
+         (processes
           (iter-make
            (cl-loop
-            for repo in (ekipage--repos)
+            for repo in (ekipage--repos recipes) when (file-exists-p repo)
             unless (call-process "git" nil nil nil "-C" repo "diff-index" "--quiet" "HEAD") do
             (message "Repository `%s' is dirty, skipping..." repo)
             else do
+            ;; (ekipage--git-ensure-remote) ; TODO
             (message "Fetching %s..." repo)
             (let ((process (make-process
                             :name (concat "ekipage-fetch-" repo)
-                            :command `("git" "-C" ,repo "fetch" "--all")
-                            :noquery t)))
+                            :command `("git" "-C" ,repo "fetch" "origin" "HEAD")
+                            :connection-type 'pipe :noquery t)))
               (process-put process :repo repo)
               (iter-yield process)))))
          (running (cl-loop repeat (num-processors)
                            for process iter-by processes collect process)))
     (while running
-      (unless (cl-loop
-               with changed finally return changed
-               for xs on running and prev = nil then xs for process = (car xs)
-               unless (process-live-p process) do
-               (setq changed t)
-               (let ((exit-status (process-exit-status process)))
-                 (if (zerop exit-status)
-                     (message "Finished: `%s'" (process-get process :repo))
-                   (message "Process `%s' failed with exit status `%s'"
-                            process exit-status)))
-               (condition-case _
-                   (setcar xs (iter-next processes))
-                 (iter-end-of-sequence
-                  (if prev (setf (cdr prev) (cdr xs)) (pop running)))))
-        (accept-process-output nil 5)))))
-
-(defun ekipage-pull-all ()
-  (interactive)
-  (cl-loop
-   with default-directory = (file-name-concat ekipage-base-dir "repos")
-   for repo in (ekipage--repos)
-   for modified = (not (call-process "git" nil nil nil "-C" repo "diff-index" "--quiet" "HEAD"))
-   if modified do
-   (message "Repository %s is dirty, skipping..." repo)
-   else do
-   (message "Fetching %s..." repo)
-   (call-process "git" nil ekipage-byte-compilation-buffer nil
-                 "-C" repo "fetch" "--all")
-   (unless (string=
-            (with-output-to-string
-              (with-current-buffer standard-output
-                (call-process "git" nil t nil "-C" repo "rev-parse" "master")))
-            (with-output-to-string
-              (with-current-buffer standard-output
-                (call-process "git" nil t nil "-C" repo "rev-parse" "origin/master"))))
-     (message "Merging into %s from origin..." repo)
-     (if (call-process "git" nil ekipage-byte-compilation-buffer nil
-                       "-C" repo "merge-base" "--is-ancestor" "HEAD" "origin/HEAD")
-         (progn
-           (make-empty-file (file-name-concat ekipage-base-dir "modified" repo) t)
-           (call-process "git" nil ekipage-byte-compilation-buffer nil
-                         "-C" repo "merge" "--ff-only"))
-       (message "Cannot fast-forward repository %s!" repo)))))
+      (cl-loop
+       with changed
+       for xs on running and prev = nil then xs for process = (car xs)
+       unless (process-live-p process) do
+       (setq changed t)
+       (let ((exit-status (process-exit-status process))
+             (repo (process-get process :repo)))
+         (if (/= exit-status 0)
+             (message "Fetching `%s' failed with exit status `%s'" repo exit-status)
+           (message "Finished fetching: `%s'" repo)
+           (cond
+            ((/= 0 (call-process
+                      "git" nil ekipage-process-buffer nil
+                      "-C" repo "merge-base" "--is-ancestor" "HEAD" "FETCH_HEAD"))
+               (message "Cannot fast-forward repository %s!" repo))
+            ((string=
+              (with-output-to-string
+                (with-current-buffer standard-output
+                  (call-process "git" nil t nil
+                                "-C" repo "rev-parse" "FETCH_HEAD")))
+              (with-output-to-string
+                (with-current-buffer standard-output
+                  (call-process "git" nil t nil
+                                "-C" repo "rev-parse" "HEAD")))))
+            (t (message "Merging into %s from origin..." repo)
+               (make-empty-file (file-name-concat ekipage-base-dir "modified" repo) t)
+               (call-process "git" nil ekipage-process-buffer nil
+                             "-C" repo "merge" "--ff-only" "--ff" "FETCH_HEAD")))))
+       (condition-case _
+           (setcar xs (iter-next processes))
+         (iter-end-of-sequence
+          ;; TODO This is iffy!
+          (if prev (setf (cdr prev) (cdr xs)) (pop running))))
+       finally (unless changed (accept-process-output nil 5))))))
 
 (provide 'ekipage)
 ;;; ekipage.el ends here
